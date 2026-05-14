@@ -4,7 +4,11 @@ A modern, high-performance web application to track, visualize, and analyze your
 
 **[Live Demo: flights.cyblocker.com](https://flights.cyblocker.com)**
 
-![AeroLog Preview](https://github.com/cyblocker/flight-records-manager/raw/main/preview.png) *(Placeholder for your preview image)*
+### Quick Deploy (Backend API)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/cyblocker/flight-records-manager&root=backend)
+
+> [!NOTE]
+> The **Frontend** should be deployed via **Cloudflare Pages** by connecting it directly to your GitHub repository for the best experience.
 
 ## Features
 
