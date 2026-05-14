@@ -1,0 +1,21 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "flight-records-frontend",
+  "compatibility_date": "2026-04-20",
+  "observability": {
+    "enabled": true
+  },
+  "assets": {
+    "not_found_handling": "single-page-application"
+  },
+  "main": "src/worker.ts",
+  "services": [
+    {
+      "binding": "BACKEND",
+      "service": "flight-records-backend"
+    }
+  ],
+  "compatibility_flags": [
+    "nodejs_compat"
+  ]
+}

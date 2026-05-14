@@ -1,0 +1,21 @@
+name = "flight-records-backend"
+compatibility_date = "2026-04-20"
+main = "src/index.ts"
+workers_dev = false
+
+[[d1_databases]]
+binding = "DB"
+database_name = "flight-records-db"
+database_id = "da6cddaf-f4b1-4a18-b16c-7cd13fdfbab8"
+migrations_dir = "drizzle"
+
+[observability]
+enabled = true
+[observability.logs]
+enabled = true
+invocation_logs = true
+persist = true
+[observability.traces]
+enabled = true
+persist = true
+head_sampling_rate = 1

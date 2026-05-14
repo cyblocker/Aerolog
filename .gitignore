@@ -1,0 +1,26 @@
+# Node.js
+node_modules/
+dist/
+out/
+.npm
+.eslintcache
+
+# Cloudflare
+.wrangler/
+.dev.vars
+wrangler.toml.bak
+
+# Secrets & Personal Data
+private/
+import.sql
+*.xls
+*.xlsx
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db

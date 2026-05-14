@@ -1,0 +1,14 @@
+{
+  "name": "flight-records-manager",
+  "private": true,
+  "scripts": {
+    "import": "npx tsx scripts/import_historical.ts"
+  },
+  "dependencies": {
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0"
+  }
+}
