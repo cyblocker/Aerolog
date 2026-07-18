@@ -53,7 +53,7 @@ export async function extractFlightsFromEmail(
   content: string,
   apiKey: string
 ): Promise<ExtractedFlight[]> {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent?key=${apiKey}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=${apiKey}`;
 
   const response = await fetch(url, {
     method: 'POST',
@@ -80,7 +80,7 @@ export async function extractFlightsFromEmail(
 
   const data: any = await response.json();
   const jsonText = data.candidates?.[0]?.content?.parts?.[0]?.text;
-  
+
   if (!jsonText) {
     throw new Error('Gemini returned an empty response');
   }
@@ -98,7 +98,7 @@ export async function getAirportDetails(
   iata: string,
   apiKey: string
 ): Promise<AirportDetails> {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent?key=${apiKey}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=${apiKey}`;
 
   const prompt = `
     Find the official metadata for the airport with IATA code: "${iata}".
@@ -131,7 +131,7 @@ export async function getAirportDetails(
   if (!jsonText) throw new Error('Gemini returned an empty response for airport lookup');
 
   const airport = JSON.parse(jsonText);
-  
+
   // High-fidelity timezone lookup from coordinates
   if (airport.latitude && airport.longitude) {
     airport.timezone = lookup(airport.latitude, airport.longitude);
