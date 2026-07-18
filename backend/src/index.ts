@@ -6,6 +6,7 @@ import { flights, airports } from './db/schema';
 import PostalMime from 'postal-mime';
 import { extractFlightsFromEmail, getAirportDetails } from './utils/gemini';
 import { FlightBot } from './bot';
+import { calculateDistance } from './utils/geo';
 
 export type Env = {
   DB: D1Database;
@@ -52,25 +53,82 @@ app.get('/api/flights/:id', async (c) => {
 
 // POST /admin/api/flights -> Create a flight manually
 app.post('/admin/api/flights', async (c) => {
-  const body = await c.req.json();
-  const db = drizzle(c.env.DB);
-  const [inserted] = await db.insert(flights).values({
-    ...body,
-    source: body.source || 'manual',
-    createdAt: new Date(),
-  }).returning();
-  return c.json(inserted, 201);
+  try {
+    const body = await c.req.json();
+    const db = drizzle(c.env.DB);
+
+    let distanceKm = body.distanceKm;
+    if (!distanceKm && body.depAirportIata && body.arrAirportIata) {
+      const [depAirport] = await db.select().from(airports).where(eq(airports.iataCode, body.depAirportIata.toUpperCase())).limit(1);
+      const [arrAirport] = await db.select().from(airports).where(eq(airports.iataCode, body.arrAirportIata.toUpperCase())).limit(1);
+      if (depAirport && arrAirport) {
+        distanceKm = calculateDistance(
+          depAirport.latitude,
+          depAirport.longitude,
+          arrAirport.latitude,
+          arrAirport.longitude
+        );
+      }
+    }
+
+    const [inserted] = await db.insert(flights).values({
+      ...body,
+      distanceKm: distanceKm || null,
+      source: body.source || 'manual',
+      createdAt: new Date(),
+    }).returning();
+    return c.json(inserted, 201);
+  } catch (err: any) {
+    console.error('Error creating flight:', err);
+    return c.json({ error: err.message || 'Internal Server Error' }, 500);
+  }
 });
 
 // PUT /admin/api/flights/:id -> Update a flight
 app.put('/admin/api/flights/:id', async (c) => {
-  const id = parseInt(c.req.param('id'), 10);
-  if (isNaN(id)) return c.json({ error: 'Invalid ID' }, 400);
-  const { id: _id, createdAt: _createdAt, ...updateFields } = await c.req.json();
-  const db = drizzle(c.env.DB);
-  const [updated] = await db.update(flights).set(updateFields).where(eq(flights.id, id)).returning();
-  if (!updated) return c.json({ error: 'Not found' }, 404);
-  return c.json(updated);
+  try {
+    const id = parseInt(c.req.param('id'), 10);
+    if (isNaN(id)) return c.json({ error: 'Invalid ID' }, 400);
+    const { id: _id, createdAt: _createdAt, ...updateFields } = await c.req.json();
+    const db = drizzle(c.env.DB);
+
+    // Fetch the existing flight to get current details
+    const [existingFlight] = await db.select().from(flights).where(eq(flights.id, id)).limit(1);
+    if (!existingFlight) return c.json({ error: 'Not found' }, 404);
+
+    let distanceKm = updateFields.distanceKm;
+    const depAirportIata = updateFields.depAirportIata || existingFlight.depAirportIata;
+    const arrAirportIata = updateFields.arrAirportIata || existingFlight.arrAirportIata;
+
+    const airportsChanged = 
+      (updateFields.depAirportIata && updateFields.depAirportIata !== existingFlight.depAirportIata) || 
+      (updateFields.arrAirportIata && updateFields.arrAirportIata !== existingFlight.arrAirportIata);
+
+    if (!distanceKm && (airportsChanged || !existingFlight.distanceKm) && depAirportIata && arrAirportIata) {
+      const [depAirport] = await db.select().from(airports).where(eq(airports.iataCode, depAirportIata.toUpperCase())).limit(1);
+      const [arrAirport] = await db.select().from(airports).where(eq(airports.iataCode, arrAirportIata.toUpperCase())).limit(1);
+      if (depAirport && arrAirport) {
+        distanceKm = calculateDistance(
+          depAirport.latitude,
+          depAirport.longitude,
+          arrAirport.latitude,
+          arrAirport.longitude
+        );
+      }
+    }
+
+    if (distanceKm !== undefined) {
+      updateFields.distanceKm = distanceKm || null;
+    } else if (airportsChanged) {
+      updateFields.distanceKm = distanceKm || null;
+    }
+
+    const [updated] = await db.update(flights).set(updateFields).where(eq(flights.id, id)).returning();
+    return c.json(updated);
+  } catch (err: any) {
+    console.error('Error updating flight:', err);
+    return c.json({ error: err.message || 'Internal Server Error' }, 500);
+  }
 });
 
 // DELETE /admin/api/flights/:id -> Delete a flight
@@ -88,22 +146,87 @@ app.get('/api/airports', async (c) => {
   const all = await db.select().from(airports).all();
   return c.json(all);
 });
+
 // POST /admin/api/airports -> Add a new airport
 app.post('/admin/api/airports', async (c) => {
-  const body = await c.req.json();
-  const db = drizzle(c.env.DB);
-  const [inserted] = await db.insert(airports).values(body).returning();
-  return c.json(inserted, 201);
+  try {
+    const body = await c.req.json();
+    const db = drizzle(c.env.DB);
+
+    const { iataCode, name, city, countryCode, latitude, longitude, timezone } = body;
+    if (!iataCode || iataCode.length !== 3) {
+      return c.json({ error: 'IATA Code must be exactly 3 characters.' }, 400);
+    }
+    if (!name) return c.json({ error: 'Airport Name is required.' }, 400);
+    if (!city) return c.json({ error: 'City is required.' }, 400);
+    if (!countryCode) return c.json({ error: 'Country code is required.' }, 400);
+
+    const lat = parseFloat(latitude);
+    const lng = parseFloat(longitude);
+    if (isNaN(lat) || lat < -90 || lat > 90) {
+      return c.json({ error: 'Latitude must be a valid number between -90 and 90.' }, 400);
+    }
+    if (isNaN(lng) || lng < -180 || lng > 180) {
+      return c.json({ error: 'Longitude must be a valid number between -180 and 180.' }, 400);
+    }
+
+    // Check unique constraint manually
+    const [existing] = await db.select().from(airports).where(eq(airports.iataCode, iataCode.toUpperCase())).limit(1);
+    if (existing) {
+      return c.json({ error: `Airport with IATA code ${iataCode.toUpperCase()} already exists.` }, 400);
+    }
+
+    const [inserted] = await db.insert(airports).values({
+      iataCode: iataCode.toUpperCase(),
+      name,
+      city,
+      countryCode: countryCode.toUpperCase(),
+      latitude: lat,
+      longitude: lng,
+      timezone: timezone || null
+    }).returning();
+    return c.json(inserted, 201);
+  } catch (err: any) {
+    console.error('Error adding airport:', err);
+    return c.json({ error: err.message || 'Internal Server Error' }, 500);
+  }
 });
 
 // PUT /admin/api/airports/:iata -> Update an airport
 app.put('/admin/api/airports/:iata', async (c) => {
-  const iata = c.req.param('iata').toUpperCase();
-  const { iataCode: _iata, ...updateFields } = await c.req.json();
-  const db = drizzle(c.env.DB);
-  const [updated] = await db.update(airports).set(updateFields).where(eq(airports.iataCode, iata)).returning();
-  if (!updated) return c.json({ error: 'Not found' }, 404);
-  return c.json(updated);
+  try {
+    const iata = c.req.param('iata').toUpperCase();
+    const body = await c.req.json();
+    const { iataCode: _iata, ...updateFields } = body;
+    const db = drizzle(c.env.DB);
+
+    const { name, city, countryCode, latitude, longitude } = updateFields;
+    if (name !== undefined && !name) return c.json({ error: 'Airport Name cannot be empty.' }, 400);
+    if (city !== undefined && !city) return c.json({ error: 'City cannot be empty.' }, 400);
+    if (countryCode !== undefined && !countryCode) return c.json({ error: 'Country code cannot be empty.' }, 400);
+
+    if (latitude !== undefined) {
+      const lat = parseFloat(latitude);
+      if (isNaN(lat) || lat < -90 || lat > 90) {
+        return c.json({ error: 'Latitude must be a valid number between -90 and 90.' }, 400);
+      }
+      updateFields.latitude = lat;
+    }
+    if (longitude !== undefined) {
+      const lng = parseFloat(longitude);
+      if (isNaN(lng) || lng < -180 || lng > 180) {
+        return c.json({ error: 'Longitude must be a valid number between -180 and 180.' }, 400);
+      }
+      updateFields.longitude = lng;
+    }
+
+    const [updated] = await db.update(airports).set(updateFields).where(eq(airports.iataCode, iata)).returning();
+    if (!updated) return c.json({ error: 'Not found' }, 404);
+    return c.json(updated);
+  } catch (err: any) {
+    console.error('Error updating airport:', err);
+    return c.json({ error: err.message || 'Internal Server Error' }, 500);
+  }
 });
 
 // DELETE /admin/api/airports/:iata -> Delete an airport
@@ -227,6 +350,9 @@ app.get('/api/stats', async (c) => {
 app.post('/internal/bot-handler', async (c) => {
   const body = await c.req.json();
   
+  if (!c.env.BOT) {
+    return c.json({ error: 'Bot not configured' }, 500);
+  }
   const bot = new FlightBot(c.env.BOT, c.env.DB);
   const result = await bot.handleUpdate(body);
   
@@ -249,7 +375,7 @@ export default {
 
       const contentToParse = `
         Subject: ${email.subject}
-        From: ${email.from.address}
+        From: ${email.from?.address || 'Unknown'}
         Date: ${email.date}
         ---
         Body:
@@ -311,6 +437,24 @@ export default {
         // --- END AUTO-INGEST ---
 
         try {
+          let distanceKm = flight.distance_km || null;
+          if (!distanceKm && flight.dep_airport_iata && flight.arr_airport_iata) {
+            try {
+              const [depAirport] = await db.select().from(airports).where(eq(airports.iataCode, flight.dep_airport_iata.toUpperCase())).limit(1);
+              const [arrAirport] = await db.select().from(airports).where(eq(airports.iataCode, flight.arr_airport_iata.toUpperCase())).limit(1);
+              if (depAirport && arrAirport) {
+                distanceKm = calculateDistance(
+                  depAirport.latitude,
+                  depAirport.longitude,
+                  arrAirport.latitude,
+                  arrAirport.longitude
+                );
+              }
+            } catch (geoErr) {
+              console.error('Failed to calculate distance for email flight:', geoErr);
+            }
+          }
+
           await db.insert(flights).values({
             flightDate: flight.flight_date,
             airlineIata: flight.airline_iata,
@@ -319,7 +463,7 @@ export default {
             arrAirportIata: flight.arr_airport_iata,
             depTime: flight.dep_time || null,
             arrTime: flight.arr_time || null,
-            distanceKm: flight.distance_km || null,
+            distanceKm: distanceKm,
             ticketNumber: flight.ticket_number || null,
             bookingRef: flight.booking_ref || null,
             cabinClass: flight.cabin_class || null,

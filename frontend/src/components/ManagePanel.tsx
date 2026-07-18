@@ -34,12 +34,22 @@ const ManagePanel: React.FC<Props> = ({ flights, airports, onDataChange, apiBase
     cabinClass: ''
   });
 
+interface AirportFormState {
+  iataCode: string;
+  name: string;
+  latitude: string;
+  longitude: string;
+  city: string;
+  countryCode: string;
+  timezone: string;
+}
+
   // Airport form state
-  const [newAirport, setNewAirport] = useState<Airport>({
+  const [newAirport, setNewAirport] = useState<AirportFormState>({
     iataCode: '',
     name: '',
-    latitude: 0,
-    longitude: 0,
+    latitude: '',
+    longitude: '',
     city: '',
     countryCode: '',
     timezone: ''
@@ -92,6 +102,28 @@ const ManagePanel: React.FC<Props> = ({ flights, airports, onDataChange, apiBase
 
   const handleAddFlight = async (e: React.FormEvent) => {
     e.preventDefault();
+
+    if (!newFlight.flightDate) {
+      alert('Flight Date is required.');
+      return;
+    }
+    if (!newFlight.airlineIata) {
+      alert('Airline IATA is required.');
+      return;
+    }
+    if (!newFlight.flightNumber) {
+      alert('Flight Number is required.');
+      return;
+    }
+    if (!newFlight.depAirportIata) {
+      alert('Departure airport is required.');
+      return;
+    }
+    if (!newFlight.arrAirportIata) {
+      alert('Arrival airport is required.');
+      return;
+    }
+
     try {
       const isEdit = !!editingFlight;
       const url = isEdit ? `${apiBase}/flights/${editingFlight.id}` : `${apiBase}/flights`;
@@ -117,9 +149,13 @@ const ManagePanel: React.FC<Props> = ({ flights, airports, onDataChange, apiBase
             cabinClass: 'Economy'
           });
         }
+      } else {
+        const errorData = await res.json().catch(() => ({}));
+        alert(`Failed to save flight: ${errorData.error || res.statusText}`);
       }
     } catch (err) {
       console.error(err);
+      alert('Network error. Failed to save flight.');
     }
   };
 
@@ -146,7 +182,15 @@ const ManagePanel: React.FC<Props> = ({ flights, airports, onDataChange, apiBase
 
   const startEditingAirport = (airport: Airport) => {
     setEditingAirport(airport);
-    setNewAirport(airport);
+    setNewAirport({
+      iataCode: airport.iataCode,
+      name: airport.name,
+      latitude: airport.latitude.toString(),
+      longitude: airport.longitude.toString(),
+      city: airport.city,
+      countryCode: airport.countryCode,
+      timezone: airport.timezone || ''
+    });
     setActiveSubTab('airports');
   };
 
@@ -155,8 +199,8 @@ const ManagePanel: React.FC<Props> = ({ flights, airports, onDataChange, apiBase
     setNewAirport({
       iataCode: '',
       name: '',
-      latitude: 0,
-      longitude: 0,
+      latitude: '',
+      longitude: '',
       city: '',
       countryCode: '',
       timezone: ''
@@ -190,6 +234,55 @@ const ManagePanel: React.FC<Props> = ({ flights, airports, onDataChange, apiBase
 
   const handleAddAirport = async (e: React.FormEvent) => {
     e.preventDefault();
+
+    // Client-side validations
+    const iata = newAirport.iataCode.trim().toUpperCase();
+    const name = newAirport.name.trim();
+    const city = newAirport.city.trim();
+    const country = newAirport.countryCode.trim().toUpperCase();
+    const latStr = newAirport.latitude.trim();
+    const lngStr = newAirport.longitude.trim();
+    const tz = newAirport.timezone.trim();
+
+    if (!iata || iata.length !== 3) {
+      alert('IATA Code must be exactly 3 letters.');
+      return;
+    }
+    if (!name) {
+      alert('Airport Name is required.');
+      return;
+    }
+    if (!city) {
+      alert('City is required.');
+      return;
+    }
+    if (!country) {
+      alert('Country code is required.');
+      return;
+    }
+    
+    const lat = parseFloat(latStr);
+    const lng = parseFloat(lngStr);
+
+    if (isNaN(lat) || lat < -90 || lat > 90) {
+      alert('Latitude must be a valid number between -90 and 90.');
+      return;
+    }
+    if (isNaN(lng) || lng < -180 || lng > 180) {
+      alert('Longitude must be a valid number between -180 and 180.');
+      return;
+    }
+
+    const payload = {
+      iataCode: iata,
+      name,
+      city,
+      countryCode: country,
+      latitude: lat,
+      longitude: lng,
+      timezone: tz || null
+    };
+
     try {
       const isEdit = !!editingAirport;
       const url = isEdit ? `${apiBase}/airports/${editingAirport.iataCode}` : `${apiBase}/airports`;
@@ -198,16 +291,20 @@ const ManagePanel: React.FC<Props> = ({ flights, airports, onDataChange, apiBase
       const res = await fetch(url, {
         method: method,
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(newAirport)
+        body: JSON.stringify(payload)
       });
       if (res.ok) {
         onDataChange();
         if (!isEdit) {
           cancelEditingAirport();
         }
+      } else {
+        const errorData = await res.json().catch(() => ({}));
+        alert(`Failed to save airport: ${errorData.error || res.statusText}`);
       }
     } catch (err) {
       console.error(err);
+      alert('Network error. Failed to save airport.');
     }
   };
 
@@ -374,11 +471,11 @@ const ManagePanel: React.FC<Props> = ({ flights, airports, onDataChange, apiBase
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.5rem' }}>
                 <div>
                   <label style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>Latitude</label>
-                  <input type="number" step="any" value={newAirport.latitude} onChange={e => setNewAirport({...newAirport, latitude: parseFloat(e.target.value)})} className="manage-input" />
+                  <input type="number" step="any" value={newAirport.latitude} onChange={e => setNewAirport({...newAirport, latitude: e.target.value})} className="manage-input" />
                 </div>
                 <div>
                   <label style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>Longitude</label>
-                  <input type="number" step="any" value={newAirport.longitude} onChange={e => setNewAirport({...newAirport, longitude: parseFloat(e.target.value)})} className="manage-input" />
+                  <input type="number" step="any" value={newAirport.longitude} onChange={e => setNewAirport({...newAirport, longitude: e.target.value})} className="manage-input" />
                 </div>
               </div>
               <button type="submit" className="manage-btn"><Save size={18} /> {editingAirport ? 'Update Airport' : 'Save Airport'}</button>
