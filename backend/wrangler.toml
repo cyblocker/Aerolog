@@ -3,6 +3,10 @@ compatibility_date = "2026-04-20"
 main = "src/index.ts"
 workers_dev = false
 
+[[services]]
+binding = "BOT"
+service = "telegram-bot-router"
+
 [[d1_databases]]
 binding = "DB"
 database_name = "flight-records-db"

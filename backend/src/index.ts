@@ -406,7 +406,7 @@ export default {
           if (!exists) {
             console.log(`Missing airport ${iata}, fetching from Gemini...`);
             try {
-              const details = await getAirportDetails(iata, env.GEMINI_API_KEY);
+              const details = await getAirportDetails(iata, env.GEMINI_API_KEY, contentToParse);
               await db.insert(airports).values({
                 iataCode: details.iataCode,
                 name: details.name,

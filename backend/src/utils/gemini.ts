@@ -96,23 +96,34 @@ export async function extractFlightsFromEmail(
 
 export async function getAirportDetails(
   iata: string,
-  apiKey: string
+  apiKey: string,
+  hintContext?: string
 ): Promise<AirportDetails> {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=${apiKey}`;
 
   const prompt = `
-    Find the official metadata for the airport with IATA code: "${iata}".
+    Find the official metadata for the commercial airport with 3-letter IATA code: "${iata}".
+    ${hintContext ? `Context hint from booking/itinerary:\n"""\n${hintContext.slice(0, 1000)}\n"""` : ''}
+
+    ### Verification Guidelines:
+    1. Verify the exact 3-letter IATA code against official international aviation registries (IATA/ICAO).
+    2. Do NOT confuse IATA codes with FAA location identifiers, US state abbreviations (e.g., AK = Alaska), or phonetic similarities.
+       - Example: AXT = Akita Airport (Akita, Japan).
+    3. Ensure latitude and longitude match the primary commercial airport for this IATA code.
+    4. If the code is obscure or ambiguous, set "confidence" to "low" and explain in "reasoning".
+
+    ### Output Schema:
     Return a JSON object with these keys: 
     "iataCode" (string, "${iata}"), 
     "name" (string, official airport name), 
     "city" (string), 
-    "countryCode" (string, 2-letter ISO), 
+    "countryCode" (string, 2-letter ISO country code), 
     "latitude" (number), 
     "longitude" (number),
     "confidence" (string, "high" or "low"),
-    "reasoning" (string, explain if confidence is low).
+    "reasoning" (string, explain if confidence is low or if ambiguity was resolved).
 
-    Only return valid JSON. Do not include any other text.
+    Only return valid JSON. Do not include any markdown or extra text outside JSON.
   `;
 
   const response = await fetch(url, {
@@ -130,7 +141,9 @@ export async function getAirportDetails(
   const jsonText = data.candidates?.[0]?.content?.parts?.[0]?.text;
   if (!jsonText) throw new Error('Gemini returned an empty response for airport lookup');
 
-  const airport = JSON.parse(jsonText);
+  const airport: AirportDetails = JSON.parse(jsonText);
+
+  console.log(`[Gemini Airport Lookup] ${iata} -> ${airport.name} (${airport.city}, ${airport.countryCode}) | Confidence: ${airport.confidence}${airport.reasoning ? ` | Reasoning: ${airport.reasoning}` : ''}`);
 
   // High-fidelity timezone lookup from coordinates
   if (airport.latitude && airport.longitude) {
