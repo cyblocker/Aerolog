@@ -71,6 +71,7 @@ const ManagePanel: React.FC<Props> = ({
   const [visibleFlightsCount, setVisibleFlightsCount] = useState(25);
   const [visibleAirportsCount, setVisibleAirportsCount] = useState(25);
   const loadMoreRef = useRef<HTMLDivElement>(null);
+  const formCardRef = useRef<HTMLDivElement>(null);
 
   const [newFlight, setNewFlight] = useState<Partial<Flight>>(createEmptyFlightForm);
 
@@ -183,6 +184,9 @@ const ManagePanel: React.FC<Props> = ({
       isPrivate: Boolean(flight.isPrivate),
     });
     setActiveSubTab('flights');
+    window.requestAnimationFrame(() => {
+      formCardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
   };
 
   const cancelEditing = () => {
@@ -221,6 +225,9 @@ const ManagePanel: React.FC<Props> = ({
       timezone: airport.timezone || '',
     });
     setActiveSubTab('airports');
+    window.requestAnimationFrame(() => {
+      formCardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
   };
 
   const cancelEditingAirport = () => {
@@ -393,9 +400,9 @@ const ManagePanel: React.FC<Props> = ({
         </button>
       </div>
 
-      <div className="stats-grid" style={{ gridTemplateColumns: '1.2fr 2fr' }}>
+      <div className="manage-grid">
         {/* ADD / EDIT FORM */}
-        <div className="card" style={{ alignSelf: 'start', position: 'sticky', top: '1rem' }}>
+        <div ref={formCardRef} className="card manage-form-card">
           <h3 style={{ marginBottom: '1.5rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
             {editingFlight || editingAirport ? (
               <Edit size={20} color="var(--accent-secondary)" />
@@ -743,7 +750,7 @@ const ManagePanel: React.FC<Props> = ({
           <h3 style={{ marginBottom: '1.5rem' }}>
             List of {activeSubTab === 'flights' ? 'Flights' : 'Airports'}
           </h3>
-          <div style={{ maxHeight: 'calc(100vh - 300px)', overflowY: 'auto', paddingRight: '0.5rem' }}>
+          <div className="manage-list-scroll">
             <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left' }}>
               <thead>
                 <tr
@@ -935,6 +942,39 @@ const ManagePanel: React.FC<Props> = ({
       </div>
 
       <style>{`
+        .manage-grid {
+          display: grid;
+          grid-template-columns: 1.2fr 2fr;
+          gap: 1.5rem;
+          margin-bottom: 2rem;
+        }
+        .manage-form-card {
+          align-self: start;
+          position: sticky;
+          top: 1rem;
+          max-height: calc(100vh - 3rem);
+          overflow-y: auto;
+        }
+        .manage-list-scroll {
+          max-height: calc(100vh - 300px);
+          overflow-y: auto;
+          padding-right: 0.5rem;
+        }
+        @media (max-width: 900px) {
+          .manage-grid {
+            grid-template-columns: 1fr;
+          }
+          .manage-form-card {
+            position: static;
+            max-height: none;
+            overflow-y: visible;
+          }
+          .manage-list-scroll {
+            max-height: none;
+            overflow-y: visible;
+            padding-right: 0;
+          }
+        }
         .manage-input {
           width: 100%;
           padding: 0.625rem;
