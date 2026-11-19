@@ -29,14 +29,14 @@ const AnalyticsDashboard: React.FC<Props> = ({ flights }) => {
     .slice(0, 10);
 
   // 3. Distance Trend (Cumulative)
-  let cumulativeDistance = 0;
   const distanceTrend = flights
     .slice()
     .sort((a, b) => a.flightDate.localeCompare(b.flightDate))
-    .map(f => {
-      cumulativeDistance += (f.distanceKm || 0);
-      return { date: f.flightDate, distance: cumulativeDistance };
-    });
+    .reduce<{ date: string; distance: number }[]>((acc, f) => {
+      const prevDistance = acc.length > 0 ? acc[acc.length - 1].distance : 0;
+      acc.push({ date: f.flightDate, distance: prevDistance + (f.distanceKm || 0) });
+      return acc;
+    }, []);
 
   // 4. Cabin Class Distribution
   const cabinData = Object.entries(

@@ -15,7 +15,10 @@ A modern, high-performance web application to track, visualize, and analyze your
 - **Interactive 3D Globe & Map**: Visualize your flight routes using Deck.gl and MapLibre GL.
 - **Detailed Analytics**: Automatic calculation of total distance, countries visited, and airline statistics.
 - **Flight Log**: Searchable and filterable table of all your historical flights.
-- **Admin Panel**: Easy management interface to add or edit flight records.
+- **Admin Panel & Owner Mode**: Unified management, upcoming trips vault (countdowns, seat, 1-tap copy PNR/ticket), and per-flight privacy controls on `/admin`.
+- **Privacy-First Public Showcase**: Server-side Option B filtering hides upcoming flights, PNRs, ticket numbers, seats, notes, local departure/arrival times, unvisited airports, and private-flagged flights — plus a uniform randomized **3–7 day delay (20% per day)** before completed flights appear publicly.
+- **Fancy Itinerary Image Generator**: Select 1 or more flights in Owner Mode to render a Retina boarding-pass PNG with an embedded curved route map and customizable privacy toggles for easy sharing with family and friends.
+- **Installable Offline PWA**: Install `/admin` to your iOS/Android Home Screen with offline caching for in-flight / airport access.
 - **Email-to-Log**: Forward your itinerary emails to a dedicated worker for automatic parsing via Gemini AI.
 - **Cloudflare Native**: Optimized for Cloudflare Pages (Frontend), Workers (Backend), and D1 (Database).
 
@@ -64,6 +67,35 @@ To allow the frontend to communicate securely with the backend:
 1.  Copy `backend/.dev.vars.example` to `backend/.dev.vars` and add your keys.
 2.  Start the backend: `cd backend && npm run dev`.
 3.  Start the frontend: `cd frontend && npm run dev`.
+
+---
+
+## 🔒 Privacy, Cloudflare Zero Trust Passkey & PWA Setup
+
+### 1. How Public Privacy Filtering Works
+- **Server-Side Redaction**: Public endpoints (`/api/flights`, `/api/airports`, `/api/stats`) never return upcoming flights, `bookingRef` (PNR), `ticketNumber`, `seat`, `notes`, `depTime`/`arrTime`, `isPrivate` flights, or airports from unflown future bookings.
+- **Randomized 3–7 Day Delay (20% / Day)**: When a flight is created or imported via email, the backend assigns a uniform random `publishDelayDays` in `{3, 4, 5, 6, 7}` using `crypto.getRandomValues`. A completed flight appears publicly only once `flightDate + publishDelayDays <= today` (and `isPrivate = false`).
+- **Database Migration**: After pulling, apply `0002_add_flight_privacy.sql` to D1:
+  ```bash
+  cd backend
+  npx wrangler d1 migrations apply flight-records-db --local
+  npx wrangler d1 migrations apply flight-records-db --remote
+  ```
+
+### 2. Cloudflare Zero Trust + Passkeys
+1. In Cloudflare **Zero Trust → Integrations → Identity providers**, add **Passkeys** (and enable *Automatically prompt on the login page*). Keep **One-time PIN** enabled as a device-enrollment fallback.
+2. Under **Access → Applications**, protect `/admin*` and `/admin/api/*` on `flights.cyblocker.com` (leaving `/`, `/api/flights`, `/api/airports`, `/api/stats` public).
+3. *(Recommended Defense-in-Depth)* Add your Access team domain, application AUD tag, and Telegram chat ID as Worker secrets so the backend cryptographically verifies Cloudflare Access JWTs and locks down the Telegram bot:
+   ```bash
+   cd backend
+   npx wrangler secret put CF_ACCESS_TEAM_DOMAIN   # e.g. myteam.cloudflareaccess.com
+   npx wrangler secret put CF_ACCESS_AUD           # Application Audience (AUD) Tag from Zero Trust
+   npx wrangler secret put AUTHORIZED_CHAT_ID      # Optional: your numeric Telegram chat ID
+   ```
+
+### 3. Installing Owner PWA & Sharing Itinerary Cards
+- **Install on Phone**: Open `https://flights.cyblocker.com/admin`, sign in with your Passkey, and tap **Add to Home Screen** (iOS Safari) / **Install App** (Android Chrome). Your flights are cached locally for offline viewing in Airplane Mode.
+- **Share Fancy Cards**: Use the **Share Trip** button in Owner Mode (or select legs in *Upcoming* / *Flight Log*) to generate a high-DPI boarding-pass PNG with a custom route map. PNR and Ticket Number remain **OFF by default**.
 
 ---
 

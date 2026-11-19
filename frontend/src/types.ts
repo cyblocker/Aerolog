@@ -5,13 +5,22 @@ export type Flight = {
   flightNumber: string;
   depAirportIata: string;
   arrAirportIata: string;
-  depTime: string | null;
-  arrTime: string | null;
-  depTimezone?: string;
+  depTime?: string | null;
+  arrTime?: string | null;
+  depTimezone?: string | null;
+  arrTimezone?: string | null;
   distanceKm: number | null;
+  ticketNumber?: string | null;
+  bookingRef?: string | null;
   cabinClass: string | null;
-  aircraftType?: string;
-  notes?: string;
+  seat?: string | null;
+  aircraftType?: string | null;
+  source?: string;
+  notes?: string | null;
+  isPrivate?: boolean;
+  publishDelayDays?: number;
+  publicReleaseDate?: string;
+  isPublicNow?: boolean;
 };
 
 export type Airport = {
@@ -21,13 +30,14 @@ export type Airport = {
   countryCode: string;
   latitude: number;
   longitude: number;
-  timezone?: string;
+  timezone?: string | null;
 };
 
 export type Stats = {
   totalFlights: number;
   completedFlights: number;
-  upcomingFlights: number;
+  upcomingFlights?: number;
+  privateFlights?: number;
   uniqueAirports: number;
   uniqueAirlines: number;
   countriesVisited: number;

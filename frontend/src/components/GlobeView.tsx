@@ -1,5 +1,9 @@
 import React, { useEffect, useRef } from 'react';
-import createGlobe from 'cobe';
+import createGlobe, { type COBEOptions } from 'cobe';
+
+type LegacyGlobeOptions = COBEOptions & {
+  onRender?: (state: Record<string, number>) => void;
+};
 
 interface Props {
   markers?: { location: [number, number], size: number }[];
@@ -13,7 +17,7 @@ const GlobeView: React.FC<Props> = ({ markers = [] }) => {
 
     if (!canvasRef.current) return;
 
-    const globe = createGlobe(canvasRef.current, {
+    const options: LegacyGlobeOptions = {
       devicePixelRatio: 2,
       width: 300 * 2,
       height: 300 * 2,
@@ -27,11 +31,12 @@ const GlobeView: React.FC<Props> = ({ markers = [] }) => {
       markerColor: [0.1, 0.8, 1],
       glowColor: [1, 1, 1],
       markers: markers.map(m => ({ location: m.location, size: m.size })),
-      onRender: (state: any) => {
+      onRender: (state: Record<string, number>) => {
         state.phi = phi;
         phi += 0.003;
       }
-    } as any);
+    };
+    const globe = createGlobe(canvasRef.current, options);
 
     return () => {
       globe.destroy();

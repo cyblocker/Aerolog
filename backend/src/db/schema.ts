@@ -17,6 +17,8 @@ export const flights = sqliteTable('flights', {
   aircraftType: text('aircraft_type'),                   // nullable
   source: text('source').notNull().default('manual'),    // import / email / manual
   notes: text('notes'),                                  // nullable
+  isPrivate: integer('is_private', { mode: 'boolean' }).notNull().default(false),
+  publishDelayDays: integer('publish_delay_days').notNull().default(5),
   createdAt: integer('created_at', { mode: 'timestamp' }),
 });
 

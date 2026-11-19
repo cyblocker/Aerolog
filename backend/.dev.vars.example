@@ -2,3 +2,14 @@
 # Do NOT commit this file to version control.
 GEMINI_API_KEY="YOUR_GEMINI_API_KEY"
 AUTHORIZED_SENDER="your-email@example.com"
+
+# Optional: Full cryptographic verification of Cloudflare Zero Trust Access JWTs
+# CF_ACCESS_TEAM_DOMAIN="your-team.cloudflareaccess.com"
+# CF_ACCESS_AUD="your-access-application-audience-tag"
+
+# Optional: Restrict Telegram FlightBot responses to your Telegram chat ID
+# AUTHORIZED_CHAT_ID="123456789"
+
+# Optional: Explicitly allow local unauthenticated /admin/api access during dev
+# DEV_BYPASS_AUTH="true"
+

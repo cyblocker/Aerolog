@@ -1,4 +1,4 @@
-CREATE TABLE `airports` (
+CREATE TABLE IF NOT EXISTS `airports` (
 	`iata_code` text PRIMARY KEY NOT NULL,
 	`name` text NOT NULL,
 	`city` text NOT NULL,
@@ -8,7 +8,7 @@ CREATE TABLE `airports` (
 	`timezone` text
 );
 --> statement-breakpoint
-CREATE TABLE `flights` (
+CREATE TABLE IF NOT EXISTS `flights` (
 	`id` integer PRIMARY KEY AUTOINCREMENT NOT NULL,
 	`flight_date` text NOT NULL,
 	`airline_iata` text NOT NULL,
