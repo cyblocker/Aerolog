@@ -1,6 +1,9 @@
 import lookup from 'tz-lookup';
 
-const GEMINI_MODEL = 'gemini-3.8-flash';
+export type GeminiThinkingLevel = 'LOW' | 'MEDIUM' | 'HIGH' | 'XHIGH';
+export const GEMINI_MODEL = 'gemini-4-hydrogen';
+export const EXTRACTION_THINKING_LEVEL: GeminiThinkingLevel = 'HIGH';
+export const AIRPORT_LOOKUP_THINKING_LEVEL: GeminiThinkingLevel = 'HIGH';
 const INVALID_IATA_CODES = new Set(['NUL', 'NULL', 'TBD', 'UNK', 'NAN', 'NIL', 'XXX', 'NONE']);
 
 export function isValidIataCode(code: unknown): code is string {
@@ -77,6 +80,13 @@ Return a JSON array of objects with these keys:
 Only output the JSON array. No conversational text.
 `;
 
+function extractResponseText(data: any): string | undefined {
+  const parts = data?.candidates?.[0]?.content?.parts;
+  if (!Array.isArray(parts)) return undefined;
+  const answerPart = parts.find((p: any) => !p?.thought && typeof p?.text === 'string');
+  return answerPart?.text ?? parts[0]?.text;
+}
+
 export async function extractFlightsFromEmail(
   content: string,
   apiKey: string,
@@ -137,6 +147,9 @@ export async function extractFlightsFromEmail(
             ],
           },
         },
+        thinkingConfig: {
+          thinkingLevel: EXTRACTION_THINKING_LEVEL,
+        },
       },
     }),
   });
@@ -147,7 +160,7 @@ export async function extractFlightsFromEmail(
   }
 
   const data: any = await response.json();
-  const jsonText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+  const jsonText = extractResponseText(data);
 
   if (!jsonText) {
     throw new Error('Gemini returned an empty response');
@@ -243,6 +256,9 @@ export async function getAirportDetails(
           },
           required: ['iataCode', 'name', 'city', 'countryCode', 'latitude', 'longitude', 'confidence'],
         },
+        thinkingConfig: {
+          thinkingLevel: AIRPORT_LOOKUP_THINKING_LEVEL,
+        },
       },
     }),
   });
@@ -250,7 +266,7 @@ export async function getAirportDetails(
   if (!response.ok) throw new Error(`Gemini API error: ${await response.text()}`);
 
   const data: any = await response.json();
-  const jsonText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+  const jsonText = extractResponseText(data);
   if (!jsonText) throw new Error('Gemini returned an empty response for airport lookup');
 
   const airport: AirportDetails = JSON.parse(jsonText);
