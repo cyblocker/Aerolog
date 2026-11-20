@@ -35,6 +35,22 @@ function runWaitUntil(c: any, promise: Promise<unknown>) {
   }
 }
 
+function escapeMd(text: unknown): string {
+  return String(text ?? '').replace(/([_*`\[])/g, '\\$1');
+}
+
+function buildAirportAlertMarkup(iataCode: string, lat: number, lon: number) {
+  return {
+    inline_keyboard: [
+      [{ text: '🗺 View on Google Maps', url: `https://maps.google.com/?q=${lat},${lon}` }],
+      [
+        { text: '✅ Keep Airport', callback_data: `airport:keep:${iataCode}` },
+        { text: '🗑️ Delete Wrong Airport', callback_data: `airport:del:${iataCode}` },
+      ],
+    ],
+  };
+}
+
 function toNullableString(val: unknown): string | null {
   if (val === null || val === undefined) return null;
   if (Array.isArray(val)) {
@@ -592,9 +608,9 @@ app.post('/admin/api/airports/auto-lookup/:iata', async (c) => {
 
     // 3. Notify user
     if (c.env.BOT) {
-      let msg = `✨ *New Airport Discovered*: ${details.iataCode} - ${details.name}`;
+      let msg = `✨ *New Airport Discovered*: ${escapeMd(details.iataCode)} - ${escapeMd(details.name)}`;
       if (details.confidence === 'low') {
-        msg += `\n⚠️ *Warning*: Gemini is not 100% sure about these coordinates.\nReasoning: ${details.reasoning}`;
+        msg += `\n⚠️ *Warning*: Gemini is not 100% sure about these coordinates.\nReasoning: ${escapeMd(details.reasoning)}`;
       }
       const airportPublicData = buildAirportReviewPublicData({
         iataCode: details.iataCode,
@@ -620,6 +636,7 @@ app.post('/admin/api/airports/auto-lookup/:iata', async (c) => {
             caption: `✨ New Airport Discovered: ${details.iataCode} - ${details.name}`,
             fallback_text: msg,
             fallback_parse_mode: 'Markdown',
+            fallback_reply_markup: buildAirportAlertMarkup(details.iataCode, details.latitude, details.longitude),
           }),
         }))
       );
@@ -736,9 +753,9 @@ export default {
               });
 
               if (env.BOT) {
-                let msg = `✨ *Auto-Ingested New Airport*: ${details.iataCode} - ${details.name}`;
+                let msg = `✨ *Auto-Ingested New Airport*: ${escapeMd(details.iataCode)} - ${escapeMd(details.name)}`;
                 if (details.confidence === 'low') {
-                  msg += `\n⚠️ *Warning*: Gemini is not 100% sure about these coordinates.\nReasoning: ${details.reasoning}`;
+                  msg += `\n⚠️ *Warning*: Gemini is not 100% sure about these coordinates.\nReasoning: ${escapeMd(details.reasoning)}`;
                 }
                 const airportPublicData = buildAirportReviewPublicData({
                   iataCode: details.iataCode,
@@ -763,6 +780,7 @@ export default {
                       caption: `✨ Auto-Ingested New Airport: ${details.iataCode} - ${details.name}`,
                       fallback_text: msg,
                       fallback_parse_mode: 'Markdown',
+                      fallback_reply_markup: buildAirportAlertMarkup(details.iataCode, details.latitude, details.longitude),
                     }),
                   }))
                 );
@@ -890,6 +908,17 @@ export default {
               arrCity,
             });
 
+            const importMarkupRows: any[][] = [];
+            const trimmedPnr = String(bookingRef || '').trim();
+            if (trimmedPnr.length >= 1 && trimmedPnr.length <= 256) {
+              importMarkupRows.push([{ text: `📋 Copy PNR (${trimmedPnr})`, copy_text: { text: trimmedPnr } }]);
+            }
+            const importActionRow: any[] = [{ text: '🕒 Upcoming Flights', callback_data: 'flight_next:0' }];
+            if (insertedFlight?.id) {
+              importActionRow.push({ text: '🗑️ Undo Import', callback_data: `flight_del_ask:${insertedFlight.id}` });
+            }
+            importMarkupRows.push(importActionRow);
+
             ctx.waitUntil(
               env.BOT.fetch(new Request("http://bot/api/notify-admin", {
                 method: 'POST',
@@ -902,6 +931,7 @@ export default {
                   caption: `✈️ Imported ${flightRef}: ${depIata} → ${arrIata} on ${flightDate}`,
                   fallback_text: flightMsg,
                   fallback_parse_mode: 'Markdown',
+                  fallback_reply_markup: { inline_keyboard: importMarkupRows },
                 }),
               }))
             );
@@ -961,6 +991,13 @@ export default {
           arrCity: cityMap.get(flight.arrAirportIata) ?? null,
         });
 
+        const remindRows: any[][] = [];
+        const trimmedPnr = String(flight.bookingRef || '').trim();
+        if (trimmedPnr.length >= 1 && trimmedPnr.length <= 256) {
+          remindRows.push([{ text: `📋 Copy PNR (${trimmedPnr})`, copy_text: { text: trimmedPnr } }]);
+        }
+        remindRows.push([{ text: '🕒 Upcoming Flights', callback_data: 'flight_next:0' }]);
+
         await env.BOT.fetch(new Request("http://bot/api/notify-admin", {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -972,6 +1009,7 @@ export default {
             caption: `⏰ Flight Tomorrow: ${flightRef} (${flight.depAirportIata} → ${flight.arrAirportIata} at ${flight.depTime || 'TBD'})`,
             fallback_text: msg,
             fallback_parse_mode: 'Markdown',
+            fallback_reply_markup: { inline_keyboard: remindRows },
           }),
         }));
       }

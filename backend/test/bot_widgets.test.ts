@@ -7,7 +7,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { drizzle } from 'drizzle-orm/d1';
 import { eq } from 'drizzle-orm';
 import { airports, flights } from '../src/db/schema';
-import { FlightBot } from '../src/bot';
+import { FlightBot, resetWidgetGateCache } from '../src/bot';
 import worker from '../src/index';
 import {
   AIRPORT_REVIEW_HTML,
@@ -90,14 +90,14 @@ function createMemoryD1() {
   return { d1, sqlite };
 }
 
-function makeBotMock(opts: { failSendWidget?: boolean } = {}) {
+function makeBotMock(opts: { failSendWidget?: boolean; failWidgetDesc?: string } = {}) {
   const calls: Array<{ url: string; body: any }> = [];
   const fetcher = {
     async fetch(req: Request): Promise<Response> {
       const body = await req.json().catch(() => null);
       calls.push({ url: req.url, body });
       if (req.url.endsWith('/api/sendWidget') && opts.failSendWidget) {
-        return Response.json({ ok: false, description: 'widget disabled' }, { status: 400 });
+        return Response.json({ ok: false, description: opts.failWidgetDesc || 'widget disabled' }, { status: 400 });
       }
       return Response.json({ ok: true, result: { message_id: 99 } });
     },
@@ -318,11 +318,142 @@ test('scheduled cron sends FLIGHT_CARD_HTML widget and sendWidget falls back to 
   assert.equal(botMock.calls[0].body.html, FLIGHT_CARD_HTML);
   assert.equal(JSON.parse(botMock.calls[0].body.public_data).k, 'remind');
   assert.equal(JSON.parse(botMock.calls[0].body.public_data).fn, 'JL25');
+  assert.equal(botMock.calls[0].body.fallback_reply_markup.inline_keyboard[0][0].copy_text.text, 'PNR111');
+  assert.equal(botMock.calls[0].body.fallback_reply_markup.inline_keyboard[1][0].callback_data, 'flight_next:0');
 
+  resetWidgetGateCache();
   const failingBot = makeBotMock({ failSendWidget: true });
   const bot = new FlightBot(failingBot.fetcher, d1);
   await bot.handleUpdate({ message: { chat: { id: 123456 }, from: { id: 123456 }, text: '/flight_stats' } });
   assert.equal(failingBot.calls.length, 2);
   assert.match(failingBot.calls[0].url, /\/api\/sendWidget$/);
   assert.match(failingBot.calls[1].url, /\/api\/sendMessage$/);
+});
+
+test('non-widget fallback flows: Flight Menu, Prev/Next upcoming navigation, copy PNR, paginated history/search, delete & airport callbacks', async () => {
+  resetWidgetGateCache();
+  const { d1 } = createMemoryD1();
+  await seedFlightsAndAirports(d1);
+  const db = drizzle(d1);
+  // Seed extra past flights so history has > 1 page (total 7 past flights)
+  for (let i = 1; i <= 5; i++) {
+    await db.insert(flights).values({
+      flightDate: dateOffsetDays(-40 - i),
+      airlineIata: 'JL',
+      flightNumber: `JL${900 + i}`,
+      depAirportIata: 'HND',
+      arrAirportIata: 'KIX',
+      bookingRef: `H${i}`,
+      source: 'manual',
+    });
+  }
+
+  const botMock = makeBotMock({
+    failSendWidget: true,
+    failWidgetDesc: 'Bad Request: INPUT_MEDIA_WIDGET_NOT_ALLOWED',
+  });
+  const bot = new FlightBot(botMock.fetcher, d1, '123456');
+
+  try {
+    // 1. /flight shows AeroLog Flight Menu in fallback mode and caches widget block
+    await bot.handleUpdate({ message: { chat: { id: 123456 }, from: { id: 123456 }, text: '/flight' } });
+    assert.equal(botMock.calls.length, 2);
+    assert.match(botMock.calls[1].body.text, /AeroLog — Flight Menu/);
+    const menuBtns = botMock.calls[1].body.reply_markup.inline_keyboard.flat();
+    assert.ok(menuBtns.some((b: any) => b.callback_data === 'flight_next:0'));
+    assert.ok(menuBtns.some((b: any) => b.callback_data === 'flight_stats'));
+    assert.ok(menuBtns.some((b: any) => b.callback_data === 'flight_recent:0'));
+    assert.ok(menuBtns.some((b: any) => b.callback_data === 'flight_search_prompt'));
+
+    // 2. flight_next:0 shows JL25 with Copy PNR, Next Flight -> (1), Back to Menu
+    botMock.calls.length = 0;
+    await bot.handleUpdate({
+      callback_query: { id: 'cb1', from: { id: 123456 }, message: { chat: { id: 123456 }, message_id: 99 }, data: 'flight_next:0' },
+    });
+    const up0 = botMock.calls.find((c) => c.url.endsWith('/api/editMessageText'));
+    assert.ok(up0);
+    assert.match(up0.body.text, /JL25/);
+    const btns0 = up0.body.reply_markup.inline_keyboard.flat();
+    assert.ok(btns0.some((b: any) => b.copy_text?.text === 'PNR111'));
+    assert.ok(btns0.some((b: any) => b.callback_data === 'flight_next:1'));
+    assert.ok(!btns0.some((b: any) => b.callback_data === 'flight_next:-1'));
+    assert.ok(btns0.some((b: any) => b.callback_data === 'flight_menu'));
+
+    // 3. flight_next:1 shows AC4 with Prev Flight (0)
+    botMock.calls.length = 0;
+    await bot.handleUpdate({
+      callback_query: { id: 'cb2', from: { id: 123456 }, message: { chat: { id: 123456 }, message_id: 99 }, data: 'flight_next:1' },
+    });
+    const up1 = botMock.calls.find((c) => c.url.endsWith('/api/editMessageText'));
+    assert.ok(up1);
+    assert.match(up1.body.text, /AC4/);
+    const btns1 = up1.body.reply_markup.inline_keyboard.flat();
+    assert.ok(btns1.some((b: any) => b.callback_data === 'flight_next:0'));
+    assert.ok(btns1.some((b: any) => b.copy_text?.text === 'PNR222'));
+
+    // 4. flight_recent:1 shows Page 2/2 slice instead of repeating page 1
+    botMock.calls.length = 0;
+    await bot.handleUpdate({
+      callback_query: { id: 'cb3', from: { id: 123456 }, message: { chat: { id: 123456 }, message_id: 99 }, data: 'flight_recent:1' },
+    });
+    const hist2 = botMock.calls.find((c) => c.url.endsWith('/api/editMessageText'));
+    assert.ok(hist2);
+    assert.match(hist2.body.text, /Page 2\/2/);
+    assert.ok(hist2.body.reply_markup.inline_keyboard.flat().some((b: any) => b.callback_data === 'flight_recent:0'));
+
+    // 5. flight_search_prompt -> ForceReply -> search page 0 & page 1
+    botMock.calls.length = 0;
+    await bot.handleUpdate({
+      callback_query: { id: 'cb4', from: { id: 123456 }, message: { chat: { id: 123456 }, message_id: 99 }, data: 'flight_search_prompt' },
+    });
+    const promptMsg = botMock.calls.find((c) => c.url.endsWith('/api/sendMessage'));
+    assert.ok(promptMsg?.body?.reply_markup?.force_reply);
+
+    botMock.calls.length = 0;
+    await bot.handleUpdate({
+      message: {
+        chat: { id: 123456 },
+        from: { id: 123456 },
+        text: 'HND',
+        reply_to_message: { text: promptMsg!.body.text },
+      },
+    });
+    const srchMsg = botMock.calls.find((c) => c.url.endsWith('/api/sendMessage'));
+    assert.ok(srchMsg);
+    assert.match(srchMsg.body.text, /Search Results for "HND" \(8/);
+    assert.ok(srchMsg.body.reply_markup.inline_keyboard.flat().some((b: any) => b.callback_data === 'flight_srch:1:HND'));
+
+    // 6. flight_del_ask -> flight_del removes row; airport:del deletes airport
+    const allRows = await db.select().from(flights).all();
+    const targetFlightId = allRows[0].id;
+    botMock.calls.length = 0;
+    await bot.handleUpdate({
+      callback_query: { id: 'cb5', from: { id: 123456 }, message: { chat: { id: 123456 }, message_id: 200 }, data: `flight_del_ask:${targetFlightId}` },
+    });
+    const askEdit = botMock.calls.find((c) => c.url.endsWith('/api/editMessageText'));
+    assert.ok(askEdit?.body.reply_markup.inline_keyboard.flat().some((b: any) => b.callback_data === `flight_del:${targetFlightId}`));
+
+    await bot.handleUpdate({
+      callback_query: { id: 'cb6', from: { id: 123456 }, message: { chat: { id: 123456 }, message_id: 200 }, data: `flight_del:${targetFlightId}` },
+    });
+    const afterDel = await db.select().from(flights).where(eq(flights.id, targetFlightId)).all();
+    assert.equal(afterDel.length, 0);
+
+    await bot.handleUpdate({
+      callback_query: { id: 'cb7', from: { id: 123456 }, message: { chat: { id: 123456 }, message_id: 201 }, data: 'airport:del:YVR' },
+    });
+    const yvrAfter = await db.select().from(airports).where(eq(airports.iataCode, 'YVR')).all();
+    assert.equal(yvrAfter.length, 0);
+
+    // 7. flight_menu does not call /api/sendWidget while cached and edits back to menu
+    botMock.calls.length = 0;
+    await bot.handleUpdate({
+      callback_query: { id: 'cb8', from: { id: 123456 }, message: { chat: { id: 123456 }, message_id: 99 }, data: 'flight_menu' },
+    });
+    assert.ok(!botMock.calls.some((c) => c.url.endsWith('/api/sendWidget')));
+    const backMenu = botMock.calls.find((c) => c.url.endsWith('/api/editMessageText'));
+    assert.match(backMenu!.body.text, /AeroLog — Flight Menu/);
+  } finally {
+    resetWidgetGateCache();
+  }
 });
