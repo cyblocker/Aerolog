@@ -24,7 +24,14 @@ import UpcomingTrips from './components/UpcomingTrips'
 import ShareItineraryModal from './components/ShareItineraryModal'
 import './App.css'
 
-import type { Flight, Airport, Stats } from './types'
+import type {
+  Flight,
+  Airport,
+  Stats,
+  FlightReminder,
+  OwnerProfile,
+  AnalysisStatus,
+} from './types'
 
 type TabId = 'upcoming' | 'map' | 'stats' | 'records' | 'manage'
 
@@ -32,6 +39,7 @@ interface OwnerCachePayload {
   flights: Flight[]
   airports: Airport[]
   stats: Stats | null
+  reminders?: FlightReminder[]
   syncedAt: string
 }
 
@@ -44,9 +52,13 @@ function App() {
   const isOwnerMode = isOwnerRoute && !previewPublic
 
   const [activeTab, setActiveTab] = useState<TabId>(isOwnerRoute ? 'upcoming' : 'map')
+  const [manageInitialTab, setManageInitialTab] = useState<'flights' | 'airports' | 'profile'>('flights')
   const [flights, setFlights] = useState<Flight[]>([])
   const [airports, setAirports] = useState<Airport[]>([])
   const [stats, setStats] = useState<Stats | null>(null)
+  const [reminders, setReminders] = useState<FlightReminder[]>([])
+  const [profile, setProfile] = useState<OwnerProfile | null>(null)
+  const [analysisStatus, setAnalysisStatus] = useState<AnalysisStatus | null>(null)
   const [loading, setLoading] = useState(true)
   const [authRequired, setAuthRequired] = useState(false)
   const [isOfflineFallback, setIsOfflineFallback] = useState(false)
@@ -62,12 +74,28 @@ function App() {
     const base = ownerMode ? ADMIN_API_BASE : API_BASE
     const fetchOpts: RequestInit = ownerMode ? { credentials: 'include' } : {}
 
+    if (!ownerMode) {
+      setReminders([])
+      setProfile(null)
+      setAnalysisStatus(null)
+    }
+
     try {
-      const [flightsRes, airportsRes, statsRes] = await Promise.all([
+      const corePromises = [
         fetch(`${base}/flights`, fetchOpts),
         fetch(`${base}/airports`, fetchOpts),
         fetch(`${base}/stats`, fetchOpts),
-      ])
+      ]
+      const ownerPromises = ownerMode
+        ? [
+            fetch(`${ADMIN_API_BASE}/reminders`, { credentials: 'include' }),
+            fetch(`${ADMIN_API_BASE}/profile`, { credentials: 'include' }),
+            fetch(`${ADMIN_API_BASE}/reminders/analysis-status`, { credentials: 'include' }),
+          ]
+        : []
+
+      const [flightsRes, airportsRes, statsRes, remindersRes, profileRes, statusRes] =
+        await Promise.all([...corePromises, ...ownerPromises])
 
       if (
         ownerMode &&
@@ -85,26 +113,35 @@ function App() {
         throw new Error('Failed to load AeroLog data')
       }
 
-      const [flightData, airportData, statsData] = await Promise.all([
-        flightsRes.json(),
-        airportsRes.json(),
-        statsRes.json(),
-      ])
+      const [flightData, airportData, statsData, reminderData, profileData, statusData] =
+        await Promise.all([
+          flightsRes.json(),
+          airportsRes.json(),
+          statsRes.json(),
+          remindersRes && remindersRes.ok ? remindersRes.json() : Promise.resolve([]),
+          profileRes && profileRes.ok ? profileRes.json() : Promise.resolve(null),
+          statusRes && statusRes.ok ? statusRes.json() : Promise.resolve(null),
+        ])
 
       setAuthRequired(false)
       setFlights(flightData)
       setAirports(airportData)
       setStats(statsData)
+      setReminders(ownerMode ? (reminderData as FlightReminder[]) : [])
+      setProfile(ownerMode ? (profileData as OwnerProfile | null) : null)
+      setAnalysisStatus(ownerMode ? (statusData as AnalysisStatus | null) : null)
       setIsOfflineFallback(false)
 
       if (ownerMode) {
         const syncedAt = new Date().toISOString()
         setLastSyncedAt(syncedAt)
         try {
+          // Cache flights & reminders for Airplane Mode PWA; NEVER persist private owner_profile PII in localStorage
           const payload: OwnerCachePayload = {
             flights: flightData,
             airports: airportData,
             stats: statsData,
+            reminders: reminderData as FlightReminder[],
             syncedAt,
           }
           localStorage.setItem(OWNER_CACHE_KEY, JSON.stringify(payload))
@@ -122,6 +159,9 @@ function App() {
             setFlights(cached.flights || [])
             setAirports(cached.airports || [])
             setStats(cached.stats || null)
+            setReminders(cached.reminders || [])
+            setProfile(null)
+            setAnalysisStatus(null)
             setLastSyncedAt(cached.syncedAt || null)
             setIsOfflineFallback(true)
           }
@@ -137,6 +177,72 @@ function App() {
   const fetchData = useCallback(() => {
     void loadData(isOwnerMode)
   }, [loadData, isOwnerMode])
+
+  const refreshReminders = useCallback(async () => {
+    if (!isOwnerMode) return
+    try {
+      const res = await fetch(`${ADMIN_API_BASE}/reminders`, { credentials: 'include' })
+      if (!res.ok) return
+      const data = (await res.json()) as FlightReminder[]
+      setReminders(data)
+      try {
+        const raw = localStorage.getItem(OWNER_CACHE_KEY)
+        if (raw) {
+          const cached = JSON.parse(raw) as OwnerCachePayload
+          localStorage.setItem(
+            OWNER_CACHE_KEY,
+            JSON.stringify({ ...cached, reminders: data })
+          )
+        }
+      } catch {
+        // Ignore storage errors
+      }
+    } catch {
+      // Ignore transient network errors
+    }
+  }, [ADMIN_API_BASE, isOwnerMode])
+
+  const isAnalysisActive = Boolean(analysisStatus?.isActive)
+  const initialDoneCount = (analysisStatus?.completed ?? 0) + (analysisStatus?.failed ?? 0)
+
+  useEffect(() => {
+    if (!isOwnerMode || isOfflineFallback || !isAnalysisActive) return
+
+    let cancelled = false
+    let prevDoneCount = initialDoneCount
+
+    const timer = window.setInterval(async () => {
+      try {
+        const res = await fetch(`${ADMIN_API_BASE}/reminders/analysis-status`, {
+          credentials: 'include',
+        })
+        if (!res.ok || cancelled) return
+        const nextStatus = (await res.json()) as AnalysisStatus
+        if (cancelled) return
+        setAnalysisStatus(nextStatus)
+
+        const nextDoneCount = nextStatus.completed + nextStatus.failed
+        if (nextDoneCount !== prevDoneCount || !nextStatus.isActive) {
+          prevDoneCount = nextDoneCount
+          void refreshReminders()
+        }
+      } catch {
+        // Ignore transient poll errors
+      }
+    }, 2500)
+
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [
+    ADMIN_API_BASE,
+    initialDoneCount,
+    isAnalysisActive,
+    isOfflineFallback,
+    isOwnerMode,
+    refreshReminders,
+  ])
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -276,7 +382,10 @@ function App() {
             <div
               key={item.id}
               className={`nav-item ${activeTab === item.id ? 'active' : ''}`}
-              onClick={() => setActiveTab(item.id)}
+              onClick={() => {
+                if (item.id === 'manage') setManageInitialTab('flights')
+                setActiveTab(item.id)
+              }}
             >
               <item.icon size={20} />
               <span>{item.label}</span>
@@ -553,8 +662,25 @@ function App() {
                 <UpcomingTrips
                   flights={flights}
                   airports={airports}
+                  reminders={reminders}
+                  profile={profile}
+                  analysisStatus={analysisStatus}
+                  apiBase={ADMIN_API_BASE}
+                  isOfflineFallback={isOfflineFallback}
                   onShareFlights={(ids) => setShareModalFlightIds(ids)}
-                  onNavigateTab={(tab) => setActiveTab(tab)}
+                  onNavigateTab={(tab) => {
+                    if (tab === 'profile') {
+                      setManageInitialTab('profile')
+                      setActiveTab('manage')
+                    } else {
+                      setManageInitialTab('flights')
+                      setActiveTab(tab)
+                    }
+                  }}
+                  onRemindersChange={() => {
+                    void refreshReminders()
+                  }}
+                  onAnalysisStatusChange={setAnalysisStatus}
                 />
               )}
               {activeTab === 'map' && (
@@ -573,8 +699,12 @@ function App() {
                 <ManagePanel
                   flights={flights}
                   airports={airports}
+                  profile={profile}
                   onDataChange={fetchData}
+                  onProfileSaved={(saved) => setProfile(saved)}
                   apiBase={ADMIN_API_BASE}
+                  isOfflineFallback={isOfflineFallback}
+                  initialSubTab={manageInitialTab}
                   onShareFlight={(ids) => setShareModalFlightIds(ids)}
                 />
               )}

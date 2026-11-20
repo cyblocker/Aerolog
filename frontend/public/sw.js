@@ -1,4 +1,4 @@
-const CACHE_NAME = 'aerolog-shell-v7';
+const CACHE_NAME = 'aerolog-shell-v10';
 const SHELL_ASSETS = [
   '/',
   '/index.html',

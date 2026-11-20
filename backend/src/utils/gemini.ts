@@ -1,4 +1,5 @@
 import lookup from 'tz-lookup';
+import { sanitizeHttpsUrl } from './calendar';
 
 export type GeminiThinkingLevel = 'LOW' | 'MEDIUM' | 'HIGH' | 'XHIGH';
 export const GEMINI_MODEL = 'gemini-4-hydrogen';
@@ -72,6 +73,7 @@ Your task is to parse flight confirmation emails, electronic tickets, attached e
 7. **Multiple Flights**: If the email or attached PDF contains multiple segments (connecting flights, round-trip, or multi-city itineraries), return all segments in the array.
 8. **Unknown Optional Fields**: If an optional field cannot be found, use null or omit it.
 9. **Language**: The input may be in English, Chinese (Simplified/Traditional), or Japanese. Always output IATA codes in English.
+10. **Fare Brand**: Keep "cabin_class" normalized as one of Economy, Premium Economy, Business, or First. If the email or PDF mentions a fare brand or seat rule (e.g., "Economy Light", "Basic Economy", "ANA Simple", "Saver", "Value", "Flex"), preserve that fare brand concisely inside "notes".
 
 ### JSON Schema:
 Return a JSON array of objects with these keys:
@@ -300,4 +302,283 @@ export async function getAirportDetails(
   }
 
   return airport;
+}
+
+export interface TravelerProfileContext {
+  citizenships?: string | null;
+  residencyCountry?: string | null;
+  residencyStatus?: string | null;
+  visasAndPrograms?: string | null;
+  frequentFlyerStatuses?: string | null;
+  mealPreferences?: string | null;
+}
+
+export interface FlightLogisticsInput {
+  airlineIata: string;
+  flightNumber: string;
+  flightDate: string;
+  depAirportIata: string;
+  depCity?: string | null;
+  depCountryCode?: string | null;
+  arrAirportIata: string;
+  arrCity?: string | null;
+  arrCountryCode?: string | null;
+  depTime?: string | null;
+  cabinClass?: string | null;
+  aircraftType?: string | null;
+  hasSeat: boolean;
+  isDomestic: boolean;
+  daysUntilFlight: number;
+  fareNotes?: string | null;
+  connectingLegsSummary?: string | null;
+}
+
+export type LogisticsCategory = 'meal' | 'border' | 'checkin' | 'seat' | 'custom';
+
+export interface GeneratedLogisticsItem {
+  category: LogisticsCategory;
+  title: string;
+  details: string;
+  actionUrl: string | null;
+  granularity: 'day' | 'exact';
+  daysBeforeFlight: number | null;
+  hoursBeforeDeparture: number | null;
+  seatDeferredToCheckin?: boolean;
+}
+
+const ALLOWED_LOGISTICS_CATEGORIES = new Set<LogisticsCategory>([
+  'meal',
+  'border',
+  'checkin',
+  'seat',
+  'custom',
+]);
+
+const LOGISTICS_RESPONSE_SCHEMA = {
+  type: 'ARRAY',
+  items: {
+    type: 'OBJECT',
+    properties: {
+      category: { type: 'STRING', enum: ['meal', 'border', 'checkin', 'seat', 'custom'], nullable: false },
+      title: { type: 'STRING', nullable: false },
+      details: { type: 'STRING', nullable: false },
+      actionUrl: { type: 'STRING', nullable: true },
+      granularity: { type: 'STRING', enum: ['day', 'exact'], nullable: false },
+      daysBeforeFlight: { type: 'INTEGER', nullable: true },
+      hoursBeforeDeparture: { type: 'INTEGER', nullable: true },
+      seatDeferredToCheckin: { type: 'BOOLEAN', nullable: true },
+    },
+    required: ['category', 'title', 'details', 'granularity'],
+  },
+};
+
+function parseJsonArrayFromText(rawText: string): unknown[] {
+  const cleaned = rawText
+    .replace(/```json\s*/gi, '')
+    .replace(/```/g, '')
+    .trim();
+  try {
+    const parsed = JSON.parse(cleaned);
+    if (Array.isArray(parsed)) return parsed;
+    if (parsed && typeof parsed === 'object' && Array.isArray((parsed as any).items)) {
+      return (parsed as any).items;
+    }
+  } catch {
+    const start = cleaned.indexOf('[');
+    const end = cleaned.lastIndexOf(']');
+    if (start >= 0 && end > start) {
+      const sliced = JSON.parse(cleaned.slice(start, end + 1));
+      if (Array.isArray(sliced)) return sliced;
+    }
+  }
+  return [];
+}
+
+function normalizeLogisticsItems(rawItems: unknown[]): GeneratedLogisticsItem[] {
+  const results: GeneratedLogisticsItem[] = [];
+  for (const raw of rawItems) {
+    if (!raw || typeof raw !== 'object') continue;
+    const item = raw as Record<string, unknown>;
+    const rawCat = String(item.category || '').trim().toLowerCase() as LogisticsCategory;
+    const category: LogisticsCategory = ALLOWED_LOGISTICS_CATEGORIES.has(rawCat) ? rawCat : 'custom';
+
+    const title = String(item.title || '').trim().slice(0, 140);
+    const details = String(item.details || '').trim().slice(0, 600);
+    if (!title) continue;
+
+    const granularity: 'day' | 'exact' =
+      category === 'checkin' && item.granularity === 'exact' ? 'exact' : item.granularity === 'exact' ? 'exact' : 'day';
+
+    let daysBeforeFlight: number | null = null;
+    if (typeof item.daysBeforeFlight === 'number' && Number.isFinite(item.daysBeforeFlight)) {
+      daysBeforeFlight = Math.max(0, Math.min(180, Math.round(item.daysBeforeFlight)));
+    }
+
+    let hoursBeforeDeparture: number | null = null;
+    if (typeof item.hoursBeforeDeparture === 'number' && Number.isFinite(item.hoursBeforeDeparture)) {
+      hoursBeforeDeparture = Math.max(1, Math.min(168, Math.round(item.hoursBeforeDeparture)));
+    }
+
+    const actionUrl = sanitizeHttpsUrl(typeof item.actionUrl === 'string' ? item.actionUrl : null);
+
+    results.push({
+      category,
+      title,
+      details,
+      actionUrl,
+      granularity,
+      daysBeforeFlight,
+      hoursBeforeDeparture,
+      ...(typeof item.seatDeferredToCheckin === 'boolean'
+        ? { seatDeferredToCheckin: item.seatDeferredToCheckin }
+        : {}),
+    });
+
+    if (results.length >= 4) break;
+  }
+  return results;
+}
+
+export async function generateFlightLogistics(
+  flight: FlightLogisticsInput,
+  profile: TravelerProfileContext,
+  apiKey: string,
+  timeoutMs = 18_000
+): Promise<GeneratedLogisticsItem[]> {
+  if (!apiKey) return [];
+
+  const profileLines = [
+    profile.citizenships ? `Citizenships: ${profile.citizenships}` : null,
+    profile.residencyCountry ? `Resident of: ${profile.residencyCountry}` : null,
+    profile.residencyStatus ? `Residency Status: ${profile.residencyStatus}` : null,
+    profile.visasAndPrograms ? `Visas / Trusted Traveler: ${profile.visasAndPrograms}` : null,
+    profile.frequentFlyerStatuses ? `Frequent Flyer Status: ${profile.frequentFlyerStatuses}` : null,
+    profile.mealPreferences ? `Meal Preferences: ${profile.mealPreferences}` : null,
+  ].filter(Boolean);
+
+  const prompt = `
+You are a concise aviation concierge & travel logistics analyst.
+Given ONE upcoming flight segment and optional anonymous traveler attributes, return **0 to 4 high-signal, genuinely actionable pre-flight tasks**.
+
+### Flight Details (No PII):
+- Airline / Flight: ${flight.airlineIata} / ${flight.flightNumber}
+- Departure Date: ${flight.flightDate} (${Math.max(0, Math.round(flight.daysUntilFlight))} days from today)
+- Route: ${flight.depAirportIata} (${[flight.depCity, flight.depCountryCode].filter(Boolean).join(', ') || 'Unknown'}) -> ${flight.arrAirportIata} (${[flight.arrCity, flight.arrCountryCode].filter(Boolean).join(', ') || 'Unknown'})
+- Domestic Segment: ${flight.isDomestic ? 'Yes' : 'No (International)'}
+- Cabin: ${flight.cabinClass || 'Unknown'}
+- Aircraft: ${flight.aircraftType || 'Unknown'}
+- Seat Already Assigned: ${flight.hasSeat ? 'Yes' : 'No'}
+${flight.fareNotes ? `- Fare / Ticket Hint: ${flight.fareNotes}` : ''}
+${flight.connectingLegsSummary ? `- Adjacent Itinerary Context: ${flight.connectingLegsSummary}` : ''}
+
+### Anonymous Traveler Context:
+${profileLines.length > 0 ? profileLines.join('\n') : 'None provided (assume standard passport/visa verification needed for international legs; keep border notes general and prompt traveler to check official portals).'}
+
+### Strict Selection Rules:
+1. **High-signal only (0 to 4 items max)**: NEVER output generic advice like "pack passport", "arrive 2h early", or "charge phone". If nothing special applies, return [].
+2. **Airline Meal / Service Pre-Selection (category="meal", granularity="day")**: Check if this airline + cabin offers advance meal pre-order programs (e.g., Singapore Airlines Book the Cook / In-the-Air menu, SWISS Pre-Select, JAL/ANA advance meal order, Qatar Pre-Select Dining, ANA/EVA/CX special pre-order). Set daysBeforeFlight to when the booking window should be acted on (e.g. 14 or 7, or current daysUntilFlight if already inside window).
+3. **Border / Entry / Customs / Visa (category="border", granularity="day")**:
+   - Skip for domestic flights unless special territory rules apply.
+   - Tailor strictly to Citizenship + Residency + Visas if provided! (e.g., residents/citizens returning to Japan still benefit from Visit Japan Web customs QR if helpful, but do NOT suggest tourist visas; Taiwan/Singapore/Thailand/Malaysia/Indonesia/Korea arrival cards or ESTA/ETA/NZeTA/K-ETA rules).
+   - Briefly remind traveler to verify current official requirements.
+4. **Online Check-In Window (category="checkin", granularity="exact")**:
+   - Check airline's exact online check-in opening time in hoursBeforeDeparture (e.g. 24 for ANA/JAL, 23 for SWISS, 48 for SQ).
+   - Only skip Japan domestic JAL/ANA online check-in when "Seat Already Assigned" is "Yes".
+   - Whenever "Seat Already Assigned" is "No" (including Japan domestic NH/JL or Light/Basic/Simple fares), DO generate an exact "checkin" reminder noting that online check-in opens for seat selection!
+   - If Fare / Ticket Hint indicates Light / Basic Economy / Simple / Saver fare without free advance seat selection (or the airline restricts free seat selection until check-in), set "seatDeferredToCheckin": true on the "checkin" item.
+5. **Airline-Specific Timed Seat Window (category="seat", granularity="day")**:
+   - Do NOT create a generic "select seat" reminder simply because Seat Already Assigned is "No" (handled separately).
+   - ONLY create a "seat" item if this specific airline/fare/status has a notable timed seat window (e.g. paid advance seats become free at T-48h or T-7d).
+6. **URLs**: Only include an official airline or government "actionUrl" starting with "https://" if confident; otherwise null.
+7. Output a pure JSON array matching:
+   [{ "category": "meal|border|checkin|seat|custom", "title": "...", "details": "...", "actionUrl": "https://..." | null, "granularity": "day|exact", "daysBeforeFlight": integer|null, "hoursBeforeDeparture": integer|null, "seatDeferredToCheckin": boolean|null }]
+`;
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`;
+
+  const strategies: Array<{ name: string; body: Record<string, unknown> }> = [
+    {
+      name: 'googleSearch+jsonSchema',
+      body: {
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        tools: [{ googleSearch: {} }],
+        generationConfig: {
+          responseMimeType: 'application/json',
+          responseSchema: LOGISTICS_RESPONSE_SCHEMA,
+          thinkingConfig: { thinkingLevel: 'LOW' },
+        },
+      },
+    },
+    {
+      name: 'googleSearch+plainText',
+      body: {
+        contents: [{ role: 'user', parts: [{ text: `${prompt}\n\nRespond ONLY with the raw JSON array.` }] }],
+        tools: [{ googleSearch: {} }],
+        generationConfig: {
+          thinkingConfig: { thinkingLevel: 'LOW' },
+        },
+      },
+    },
+    {
+      name: 'jsonSchemaNoTools',
+      body: {
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: {
+          responseMimeType: 'application/json',
+          responseSchema: LOGISTICS_RESPONSE_SCHEMA,
+          thinkingConfig: { thinkingLevel: 'LOW' },
+        },
+      },
+    },
+  ];
+
+  let lastError: Error | null = null;
+  const deadlineMs = Date.now() + Math.max(2_000, timeoutMs);
+
+  for (const strategy of strategies) {
+    const remainingMs = deadlineMs - Date.now();
+    if (remainingMs < 1_500) {
+      break;
+    }
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(strategy.body),
+        signal: AbortSignal.timeout(remainingMs),
+      });
+
+      if (!response.ok) {
+        const errBody = await response.text();
+        lastError = new Error(`Gemini (${strategy.name}) HTTP ${response.status}: ${errBody.slice(0, 300)}`);
+        if (response.status === 400) {
+          console.warn(`[Logistics AI] Fallback from ${strategy.name}: HTTP 400`);
+          continue;
+        }
+        if (response.status === 401 || response.status === 403 || response.status === 429) {
+          throw lastError;
+        }
+        console.warn(`[Logistics AI] Fallback from ${strategy.name}: HTTP ${response.status}`);
+        continue;
+      }
+
+      const data: any = await response.json();
+      const text = extractResponseText(data);
+      if (!text) return [];
+      const rawItems = parseJsonArrayFromText(text);
+      return normalizeLogisticsItems(rawItems);
+    } catch (err: any) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      console.warn(`[Logistics AI] Strategy ${strategy.name} failed:`, lastError.message);
+      if (/HTTP (401|403|429):/.test(lastError.message)) {
+        break;
+      }
+    }
+  }
+
+  if (lastError) {
+    throw lastError;
+  }
+  return [];
 }

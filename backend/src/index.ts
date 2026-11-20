@@ -1,8 +1,8 @@
 import { Hono, type Context } from 'hono';
 import { cors } from 'hono/cors';
 import { drizzle } from 'drizzle-orm/d1';
-import { eq } from 'drizzle-orm';
-import { flights, airports } from './db/schema';
+import { asc, eq } from 'drizzle-orm';
+import { flights, airports, ownerProfile, flightReminders, flightAnalysisJobs } from './db/schema';
 import PostalMime from 'postal-mime';
 import { extractFlightsFromEmail, getAirportDetails, isValidIataCode, type InlineAttachmentPart } from './utils/gemini';
 import { FlightBot } from './bot';
@@ -21,6 +21,29 @@ import {
   toPublicFlight,
 } from './utils/privacy';
 import { verifyOwnerRequest } from './utils/auth';
+import { buildReminderIcs, sanitizeHttpsUrl } from './utils/calendar';
+import {
+  convertSeatReminderToCheckin,
+  ensureRuleRemindersForFlight,
+  generateRemindersForFlight,
+  getOwnerProfile,
+  resolveProfilePrefs,
+  syncRemindersOnFlightUpdate,
+  type FlightReminderRow,
+} from './utils/logistics';
+import {
+  enqueueFlightsForAnalysis,
+  getAnalysisStatus,
+  processAnalysisQueueWave,
+} from './utils/analysisQueue';
+import { runScheduledReminders } from './utils/scheduler';
+import {
+  computeCheckinRemindAtUtc,
+  computeDayRemindAtUtc,
+  getLocalYmdInTz,
+  isValidIanaTimeZone,
+  toAirportUtcMs,
+} from './utils/time';
 
 function runWaitUntil(c: any, promise: Promise<unknown>) {
   const safe = promise.catch((err) => console.error('Background notification error:', err));
@@ -310,6 +333,51 @@ app.get('/admin/api/stats', async (c) => {
   return c.json(buildStatsPayload(allFlights, airportMap, { includeOwnerCounts: true, todayUtc }));
 });
 
+const ALLOWED_REMINDER_CATEGORIES = new Set([
+  'departure',
+  'seat',
+  'checkin',
+  'meal',
+  'border',
+  'custom',
+]);
+const ALLOWED_REMINDER_STATUSES = new Set(['pending', 'done', 'dismissed']);
+
+async function enrichRemindersWithFlights(
+  db: ReturnType<typeof drizzle>,
+  rows: FlightReminderRow[]
+) {
+  if (rows.length === 0) return [];
+  const [allFlights, allAirports] = await Promise.all([
+    db.select().from(flights).all(),
+    db.select().from(airports).all(),
+  ]);
+  const flightMap = new Map(allFlights.map((f) => [f.id, f]));
+  const airportMap = new Map(allAirports.map((a) => [a.iataCode, a]));
+
+  return rows.map((r) => {
+    const f = r.flightId ? flightMap.get(r.flightId) : undefined;
+    const depAp = f ? airportMap.get(f.depAirportIata) : undefined;
+    return {
+      ...r,
+      flight: f
+        ? {
+            id: f.id,
+            flightDate: f.flightDate,
+            airlineIata: f.airlineIata,
+            flightNumber: f.flightNumber,
+            depAirportIata: f.depAirportIata,
+            arrAirportIata: f.arrAirportIata,
+            depTime: f.depTime,
+            depTimezone: depAp?.timezone ?? null,
+            bookingRef: f.bookingRef,
+            seat: f.seat,
+          }
+        : null,
+    };
+  });
+}
+
 // POST /admin/api/flights -> Create a flight manually
 app.post('/admin/api/flights', async (c) => {
   try {
@@ -371,6 +439,26 @@ app.post('/admin/api/flights', async (c) => {
       publishDelayDays,
       createdAt: new Date(),
     }).returning();
+
+    if (inserted && body.generateReminders !== false) {
+      const [airportList, profile] = await Promise.all([
+        db.select().from(airports).all(),
+        getOwnerProfile(db),
+      ]);
+      const { homeTz } = resolveProfilePrefs(profile);
+      const todayLocal = getLocalYmdInTz(Date.now(), homeTz);
+      if (inserted.flightDate >= todayLocal) {
+        const airportMap = new Map(airportList.map((a) => [a.iataCode, a]));
+        await ensureRuleRemindersForFlight(db, inserted, airportMap, profile);
+        if (c.env.GEMINI_API_KEY) {
+          const { enqueuedIds } = await enqueueFlightsForAnalysis(db, [inserted.id]);
+          if (enqueuedIds.length > 0) {
+            runWaitUntil(c, processAnalysisQueueWave(c.env));
+          }
+        }
+      }
+    }
+
     return c.json(inserted, 201);
   } catch (err: any) {
     console.error('Error creating flight:', err);
@@ -475,7 +563,8 @@ app.put('/admin/api/flights/:id', async (c) => {
     }
 
     const [updated] = await db.update(flights).set(updateFields).where(eq(flights.id, id)).returning();
-    return c.json(updated);
+    const { autoCompletedSeatReminders } = await syncRemindersOnFlightUpdate(db, existingFlight, updated);
+    return c.json({ ...updated, autoCompletedSeatReminders });
   } catch (err: any) {
     console.error('Error updating flight:', err);
     return c.json({ error: err.message || 'Internal Server Error' }, 500);
@@ -487,6 +576,8 @@ app.delete('/admin/api/flights/:id', async (c) => {
   const id = parseInt(c.req.param('id'), 10);
   if (isNaN(id)) return c.json({ error: 'Invalid ID' }, 400);
   const db = drizzle(c.env.DB);
+  await db.delete(flightAnalysisJobs).where(eq(flightAnalysisJobs.flightId, id));
+  await db.delete(flightReminders).where(eq(flightReminders.flightId, id));
   await db.delete(flights).where(eq(flights.id, id));
   return c.json({ success: true });
 });
@@ -645,6 +736,571 @@ app.post('/admin/api/airports/auto-lookup/:iata', async (c) => {
     return c.json(inserted);
   } catch (err) {
     return c.json({ error: 'Failed to lookup airport' }, 500);
+  }
+});
+
+// ============================================================
+// Owner Traveler Profile & Pre-Flight Logistics Reminders
+// (Strictly behind Zero Trust /admin/api/* - never public)
+// ============================================================
+
+// GET /admin/api/profile -> Private traveler profile
+app.get('/admin/api/profile', async (c) => {
+  const db = drizzle(c.env.DB);
+  const profile = await getOwnerProfile(db);
+  return c.json(profile);
+});
+
+// PUT /admin/api/profile -> Upsert optional private traveler profile
+app.put('/admin/api/profile', async (c) => {
+  try {
+    const body = await c.req.json();
+    const db = drizzle(c.env.DB);
+
+    const homeTimezone = toNullableString(body.homeTimezone);
+    if (homeTimezone && !isValidIanaTimeZone(homeTimezone)) {
+      return c.json({ error: 'Invalid IANA timezone (e.g. Asia/Tokyo, America/Los_Angeles).' }, 400);
+    }
+
+    let dailyReminderHour: number | null = null;
+    if (body.dailyReminderHour !== null && body.dailyReminderHour !== undefined && body.dailyReminderHour !== '') {
+      const parsed = Number(body.dailyReminderHour);
+      if (!Number.isInteger(parsed) || parsed < 0 || parsed > 23) {
+        return c.json({ error: 'dailyReminderHour must be an integer between 0 and 23.' }, 400);
+      }
+      dailyReminderHour = parsed;
+    }
+
+    const now = new Date();
+    const values = {
+      id: 1,
+      citizenships: toNullableString(body.citizenships),
+      residencyCountry: toNullableString(body.residencyCountry),
+      residencyStatus: toNullableString(body.residencyStatus),
+      visasAndPrograms: toNullableString(body.visasAndPrograms),
+      frequentFlyerStatuses: toNullableString(body.frequentFlyerStatuses),
+      mealPreferences: toNullableString(body.mealPreferences),
+      homeTimezone,
+      dailyReminderHour,
+      updatedAt: now,
+    };
+
+    const [saved] = await db
+      .insert(ownerProfile)
+      .values(values)
+      .onConflictDoUpdate({
+        target: ownerProfile.id,
+        set: {
+          citizenships: values.citizenships,
+          residencyCountry: values.residencyCountry,
+          residencyStatus: values.residencyStatus,
+          visasAndPrograms: values.visasAndPrograms,
+          frequentFlyerStatuses: values.frequentFlyerStatuses,
+          mealPreferences: values.mealPreferences,
+          homeTimezone: values.homeTimezone,
+          dailyReminderHour: values.dailyReminderHour,
+          updatedAt: values.updatedAt,
+        },
+      })
+      .returning();
+
+    return c.json(saved);
+  } catch (err: any) {
+    console.error('Error updating profile:', err);
+    return c.json({ error: err.message || 'Internal Server Error' }, 500);
+  }
+});
+
+// GET /admin/api/reminders -> List pre-flight checklist items & reminders
+app.get('/admin/api/reminders', async (c) => {
+  const db = drizzle(c.env.DB);
+  const flightIdParam = c.req.query('flightId');
+  const statusParam = c.req.query('status');
+
+  let rows = await db
+    .select()
+    .from(flightReminders)
+    .orderBy(asc(flightReminders.remindAtUtc), asc(flightReminders.id))
+    .all();
+
+  if (flightIdParam !== undefined && flightIdParam !== '') {
+    const fid = parseInt(flightIdParam, 10);
+    if (Number.isNaN(fid)) return c.json({ error: 'Invalid flightId query param' }, 400);
+    rows = rows.filter((r) => r.flightId === fid);
+  }
+  if (statusParam && ALLOWED_REMINDER_STATUSES.has(statusParam)) {
+    rows = rows.filter((r) => r.status === statusParam);
+  }
+
+  return c.json(await enrichRemindersWithFlights(db, rows));
+});
+
+// POST /admin/api/reminders -> Add custom reminder manually
+app.post('/admin/api/reminders', async (c) => {
+  try {
+    const body = await c.req.json();
+    const db = drizzle(c.env.DB);
+
+    const title = toNullableString(body.title);
+    if (!title) {
+      return c.json({ error: 'title is required.' }, 400);
+    }
+
+    const rawCategory = (toNullableString(body.category) || 'custom').toLowerCase();
+    if (!ALLOWED_REMINDER_CATEGORIES.has(rawCategory)) {
+      return c.json({ error: 'Invalid reminder category.' }, 400);
+    }
+
+    const rawGranularity = (toNullableString(body.granularity) || 'day').toLowerCase();
+    if (rawGranularity !== 'day' && rawGranularity !== 'exact') {
+      return c.json({ error: 'granularity must be "day" or "exact".' }, 400);
+    }
+
+    const rawActionUrl = toNullableString(body.actionUrl);
+    let actionUrl: string | null = null;
+    if (rawActionUrl) {
+      actionUrl = sanitizeHttpsUrl(rawActionUrl);
+      if (!actionUrl) {
+        return c.json({ error: 'actionUrl must be a valid https:// URL.' }, 400);
+      }
+    }
+
+    let flightId: number | null = null;
+    let depTzForFlight: string | null = null;
+    if (body.flightId !== undefined && body.flightId !== null && body.flightId !== '') {
+      const parsedFid = parseInt(String(body.flightId), 10);
+      if (Number.isNaN(parsedFid)) {
+        return c.json({ error: 'Invalid flightId.' }, 400);
+      }
+      const [flight] = await db.select().from(flights).where(eq(flights.id, parsedFid)).limit(1);
+      if (!flight) {
+        return c.json({ error: 'Linked flight not found.' }, 404);
+      }
+      flightId = flight.id;
+      const [depAp] = await db
+        .select()
+        .from(airports)
+        .where(eq(airports.iataCode, flight.depAirportIata))
+        .limit(1);
+      depTzForFlight = depAp?.timezone ?? null;
+    }
+
+    const profile = await getOwnerProfile(db);
+    const { homeTz, dailyHour } = resolveProfilePrefs(profile);
+    const todayLocal = getLocalYmdInTz(Date.now(), homeTz);
+
+    let eventAtUtc: string | null = null;
+    let remindAtUtc: string | null = null;
+
+    if (rawGranularity === 'exact') {
+      const rawEventUtc = toNullableString(body.eventAtUtc);
+      const eventDate = toNullableString(body.eventDate) || toNullableString(body.remindDate);
+      const eventTime = toNullableString(body.eventTime) || toNullableString(body.remindTime);
+      const eventTz = toNullableString(body.eventTimezone) || depTzForFlight || homeTz;
+
+      if (rawEventUtc) {
+        const ms = Date.parse(rawEventUtc);
+        if (Number.isNaN(ms)) return c.json({ error: 'Invalid eventAtUtc timestamp.' }, 400);
+        eventAtUtc = new Date(ms).toISOString();
+      } else if (eventDate && eventTime) {
+        const ms = toAirportUtcMs(eventDate, eventTime, isValidIanaTimeZone(eventTz) ? eventTz : homeTz);
+        if (!ms) return c.json({ error: 'Invalid eventDate/eventTime.' }, 400);
+        eventAtUtc = new Date(ms).toISOString();
+      }
+
+      const rawRemindUtc = toNullableString(body.remindAtUtc);
+      if (rawRemindUtc) {
+        const rMs = Date.parse(rawRemindUtc);
+        if (Number.isNaN(rMs)) return c.json({ error: 'Invalid remindAtUtc timestamp.' }, 400);
+        remindAtUtc = new Date(rMs).toISOString();
+      } else if (eventAtUtc) {
+        remindAtUtc = computeCheckinRemindAtUtc(Date.parse(eventAtUtc));
+      } else {
+        return c.json({ error: 'Exact reminders require eventAtUtc, eventDate+eventTime, or remindAtUtc.' }, 400);
+      }
+    } else {
+      const rawRemindUtc = toNullableString(body.remindAtUtc);
+      const remindDate = toNullableString(body.remindDate);
+      const rawEventUtc = toNullableString(body.eventAtUtc);
+
+      if (rawEventUtc) {
+        const ms = Date.parse(rawEventUtc);
+        if (Number.isNaN(ms)) return c.json({ error: 'Invalid eventAtUtc timestamp.' }, 400);
+        eventAtUtc = new Date(ms).toISOString();
+      }
+      if (rawRemindUtc) {
+        const ms = Date.parse(rawRemindUtc);
+        if (Number.isNaN(ms)) return c.json({ error: 'Invalid remindAtUtc timestamp.' }, 400);
+        remindAtUtc = new Date(ms).toISOString();
+      } else if (remindDate) {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(remindDate)) {
+          return c.json({ error: 'remindDate must be YYYY-MM-DD.' }, 400);
+        }
+        remindAtUtc = computeDayRemindAtUtc(remindDate, homeTz, dailyHour);
+      } else {
+        remindAtUtc = computeDayRemindAtUtc(todayLocal, homeTz, dailyHour);
+      }
+    }
+
+    const now = new Date();
+    const [inserted] = await db
+      .insert(flightReminders)
+      .values({
+        flightId,
+        category: rawCategory,
+        title: title.slice(0, 140),
+        details: toNullableString(body.details)?.slice(0, 600) ?? null,
+        actionUrl,
+        granularity: rawGranularity,
+        eventAtUtc,
+        remindAtUtc,
+        status: 'pending',
+        source: 'manual',
+        createdAt: now,
+        updatedAt: now,
+      })
+      .returning();
+
+    const [enriched] = await enrichRemindersWithFlights(db, [inserted]);
+    return c.json(enriched, 201);
+  } catch (err: any) {
+    console.error('Error creating reminder:', err);
+    return c.json({ error: err.message || 'Internal Server Error' }, 500);
+  }
+});
+
+// PUT /admin/api/reminders/:id -> Update or mark done/dismissed/reopen
+app.put('/admin/api/reminders/:id', async (c) => {
+  try {
+    const id = parseInt(c.req.param('id'), 10);
+    if (Number.isNaN(id)) return c.json({ error: 'Invalid ID' }, 400);
+    const body = await c.req.json();
+    const db = drizzle(c.env.DB);
+
+    const [existing] = await db
+      .select()
+      .from(flightReminders)
+      .where(eq(flightReminders.id, id))
+      .limit(1);
+    if (!existing) return c.json({ error: 'Reminder not found' }, 404);
+
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const updateFields: Partial<typeof flightReminders.$inferInsert> = {
+      updatedAt: now,
+    };
+
+    if (body.title !== undefined) {
+      const title = toNullableString(body.title);
+      if (!title) return c.json({ error: 'title cannot be empty.' }, 400);
+      updateFields.title = title.slice(0, 140);
+    }
+    if (body.details !== undefined) {
+      updateFields.details = toNullableString(body.details)?.slice(0, 600) ?? null;
+    }
+    if (body.category !== undefined) {
+      const cat = String(body.category || '').trim().toLowerCase();
+      if (!ALLOWED_REMINDER_CATEGORIES.has(cat)) {
+        return c.json({ error: 'Invalid category.' }, 400);
+      }
+      updateFields.category = cat;
+    }
+    if (body.actionUrl !== undefined) {
+      const rawUrl = toNullableString(body.actionUrl);
+      if (rawUrl) {
+        const cleanUrl = sanitizeHttpsUrl(rawUrl);
+        if (!cleanUrl) return c.json({ error: 'actionUrl must be a valid https:// URL.' }, 400);
+        updateFields.actionUrl = cleanUrl;
+      } else {
+        updateFields.actionUrl = null;
+      }
+    }
+    if (body.granularity !== undefined) {
+      const g = String(body.granularity || '').trim().toLowerCase();
+      if (g !== 'day' && g !== 'exact') {
+        return c.json({ error: 'granularity must be "day" or "exact".' }, 400);
+      }
+      updateFields.granularity = g;
+    }
+
+    const effectiveGranularity = updateFields.granularity ?? existing.granularity;
+    const profile = await getOwnerProfile(db);
+    const { homeTz, dailyHour } = resolveProfilePrefs(profile);
+
+    if (body.eventAtUtc !== undefined) {
+      const raw = toNullableString(body.eventAtUtc);
+      if (!raw) {
+        updateFields.eventAtUtc = null;
+      } else {
+        const ms = Date.parse(raw);
+        if (Number.isNaN(ms)) return c.json({ error: 'Invalid eventAtUtc.' }, 400);
+        updateFields.eventAtUtc = new Date(ms).toISOString();
+      }
+    } else if (body.eventDate && body.eventTime) {
+      const tz = toNullableString(body.eventTimezone) || homeTz;
+      const ms = toAirportUtcMs(
+        String(body.eventDate),
+        String(body.eventTime),
+        isValidIanaTimeZone(tz) ? tz : homeTz
+      );
+      if (!ms) return c.json({ error: 'Invalid eventDate/eventTime.' }, 400);
+      updateFields.eventAtUtc = new Date(ms).toISOString();
+      if (effectiveGranularity === 'exact' && body.remindAtUtc === undefined) {
+        updateFields.remindAtUtc = computeCheckinRemindAtUtc(ms);
+        updateFields.notifiedAt = null;
+      }
+    }
+
+    if (body.remindAtUtc !== undefined) {
+      const raw = toNullableString(body.remindAtUtc);
+      if (!raw) return c.json({ error: 'remindAtUtc cannot be empty.' }, 400);
+      const ms = Date.parse(raw);
+      if (Number.isNaN(ms)) return c.json({ error: 'Invalid remindAtUtc.' }, 400);
+      const iso = new Date(ms).toISOString();
+      updateFields.remindAtUtc = iso;
+      if (iso !== existing.remindAtUtc && iso > nowIso) {
+        updateFields.notifiedAt = null;
+      }
+    } else if (body.remindDate !== undefined) {
+      const dateStr = toNullableString(body.remindDate);
+      if (!dateStr || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+        return c.json({ error: 'remindDate must be YYYY-MM-DD.' }, 400);
+      }
+      const iso = computeDayRemindAtUtc(dateStr, homeTz, dailyHour);
+      updateFields.remindAtUtc = iso;
+      if (iso > nowIso) {
+        updateFields.notifiedAt = null;
+      }
+    }
+
+    if (body.status !== undefined) {
+      const st = String(body.status || '').trim().toLowerCase();
+      if (!ALLOWED_REMINDER_STATUSES.has(st)) {
+        return c.json({ error: 'status must be pending, done, or dismissed.' }, 400);
+      }
+      updateFields.status = st;
+      if (st === 'done' || st === 'dismissed') {
+        updateFields.completedAt = nowIso;
+      } else {
+        updateFields.completedAt = null;
+        const targetRemind = updateFields.remindAtUtc ?? existing.remindAtUtc;
+        if (existing.status !== 'pending' || targetRemind > nowIso) {
+          updateFields.notifiedAt = null;
+        }
+      }
+    }
+
+    const [updated] = await db
+      .update(flightReminders)
+      .set(updateFields)
+      .where(eq(flightReminders.id, id))
+      .returning();
+    const [enriched] = await enrichRemindersWithFlights(db, [updated]);
+    return c.json(enriched);
+  } catch (err: any) {
+    console.error('Error updating reminder:', err);
+    return c.json({ error: err.message || 'Internal Server Error' }, 500);
+  }
+});
+
+// DELETE /admin/api/reminders/:id -> Remove a reminder
+app.delete('/admin/api/reminders/:id', async (c) => {
+  const id = parseInt(c.req.param('id'), 10);
+  if (Number.isNaN(id)) return c.json({ error: 'Invalid ID' }, 400);
+  const db = drizzle(c.env.DB);
+  const [existing] = await db
+    .select({ id: flightReminders.id })
+    .from(flightReminders)
+    .where(eq(flightReminders.id, id))
+    .limit(1);
+  if (!existing) return c.json({ error: 'Reminder not found' }, 404);
+  await db.delete(flightReminders).where(eq(flightReminders.id, id));
+  return c.json({ success: true });
+});
+
+// GET /admin/api/reminders/:id/ics -> Export single-event .ics calendar file
+app.get('/admin/api/reminders/:id/ics', async (c) => {
+  const id = parseInt(c.req.param('id'), 10);
+  if (Number.isNaN(id)) return c.json({ error: 'Invalid ID' }, 400);
+  const db = drizzle(c.env.DB);
+  const [rem] = await db
+    .select()
+    .from(flightReminders)
+    .where(eq(flightReminders.id, id))
+    .limit(1);
+  if (!rem) return c.json({ error: 'Reminder not found' }, 404);
+
+  let calendarTitle = rem.title;
+  if (rem.flightId) {
+    const [flight] = await db
+      .select()
+      .from(flights)
+      .where(eq(flights.id, rem.flightId))
+      .limit(1);
+    if (flight) {
+      const fRef = formatFlightRef(flight.airlineIata, flight.flightNumber);
+      if (!calendarTitle.toUpperCase().includes(fRef.toUpperCase())) {
+        calendarTitle = `${fRef}: ${calendarTitle}`;
+      }
+    }
+  }
+
+  const profile = await getOwnerProfile(db);
+  const { homeTz } = resolveProfilePrefs(profile);
+  const ics = buildReminderIcs({
+    id: rem.id,
+    title: calendarTitle,
+    details: rem.details,
+    actionUrl: rem.actionUrl,
+    granularity: rem.granularity,
+    eventAtUtc: rem.eventAtUtc,
+    remindAtUtc: rem.remindAtUtc,
+    homeTz,
+  });
+
+  return new Response(ics, {
+    status: 200,
+    headers: {
+      'Content-Type': 'text/calendar; charset=utf-8',
+      'Content-Disposition': `attachment; filename="aerolog-reminder-${rem.id}.ics"`,
+    },
+  });
+});
+
+// POST /admin/api/reminders/:id/convert-to-checkin -> Dismiss seat task and add T-24h check-in alert
+app.post('/admin/api/reminders/:id/convert-to-checkin', async (c) => {
+  try {
+    const id = parseInt(c.req.param('id'), 10);
+    if (Number.isNaN(id)) return c.json({ error: 'Invalid ID' }, 400);
+    const body = await c.req.json().catch(() => ({} as any));
+    const hours =
+      typeof body?.hoursBeforeDeparture === 'number' &&
+      Number.isInteger(body.hoursBeforeDeparture) &&
+      body.hoursBeforeDeparture >= 1 &&
+      body.hoursBeforeDeparture <= 168
+        ? body.hoursBeforeDeparture
+        : undefined;
+
+    const db = drizzle(c.env.DB);
+    const res = await convertSeatReminderToCheckin(db, id, { hoursBeforeDeparture: hours });
+    if (!res.ok) {
+      return c.json({ error: res.error }, res.status);
+    }
+    const [enriched] = await enrichRemindersWithFlights(db, [res.checkinReminder]);
+    return c.json({
+      dismissedId: res.dismissedId,
+      created: res.created,
+      checkinReminder: enriched,
+    });
+  } catch (err: any) {
+    console.error('Error converting seat reminder to check-in:', err);
+    return c.json({ error: err.message || 'Internal Server Error' }, 500);
+  }
+});
+
+// GET /admin/api/reminders/analysis-status -> Poll async AI analysis progress and advance queued waves
+app.get('/admin/api/reminders/analysis-status', async (c) => {
+  const db = drizzle(c.env.DB);
+  const status = await getAnalysisStatus(db);
+  if (status.queued > 0 && status.running === 0 && c.env.GEMINI_API_KEY) {
+    runWaitUntil(c, processAnalysisQueueWave(c.env));
+  }
+  return c.json(status);
+});
+
+// POST /admin/api/flights/:id/reminders/generate -> Queue async AI logistics for one flight
+app.post('/admin/api/flights/:id/reminders/generate', async (c) => {
+  try {
+    const id = parseInt(c.req.param('id'), 10);
+    if (Number.isNaN(id)) return c.json({ error: 'Invalid ID' }, 400);
+    const body = await c.req.json().catch(() => ({} as any));
+    const force = Boolean(body?.force);
+    const db = drizzle(c.env.DB);
+
+    const [flight] = await db.select().from(flights).where(eq(flights.id, id)).limit(1);
+    if (!flight) return c.json({ error: 'Flight not found' }, 404);
+
+    const [airportList, profile] = await Promise.all([
+      db.select().from(airports).all(),
+      getOwnerProfile(db),
+    ]);
+    const airportMap = new Map(airportList.map((a) => [a.iataCode, a]));
+    await ensureRuleRemindersForFlight(db, flight, airportMap, profile);
+
+    const { enqueuedIds } = await enqueueFlightsForAnalysis(db, [flight.id], { force });
+    if (enqueuedIds.length > 0 && c.env.GEMINI_API_KEY) {
+      runWaitUntil(c, processAnalysisQueueWave(c.env));
+    }
+    const status = await getAnalysisStatus(db);
+    if (enqueuedIds.length === 0 && status.queued > 0 && status.running === 0 && c.env.GEMINI_API_KEY) {
+      runWaitUntil(c, processAnalysisQueueWave(c.env));
+    }
+
+    return c.json(
+      {
+        accepted: true,
+        alreadyRunning: enqueuedIds.length === 0,
+        enqueuedCount: enqueuedIds.length,
+        status,
+      },
+      202
+    );
+  } catch (err: any) {
+    console.error('Error queueing flight reminders:', err);
+    return c.json({ error: err.message || 'Failed to queue reminder analysis' }, 500);
+  }
+});
+
+// POST /admin/api/reminders/generate-all -> Queue async AI logistics for unanalyzed upcoming flights
+app.post('/admin/api/reminders/generate-all', async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({} as any));
+    const force = Boolean(body?.force);
+    const db = drizzle(c.env.DB);
+    const [profile, airportList, allFlights, existingJobs] = await Promise.all([
+      getOwnerProfile(db),
+      db.select().from(airports).all(),
+      db.select().from(flights).orderBy(asc(flights.flightDate), asc(flights.id)).all(),
+      db.select().from(flightAnalysisJobs).all(),
+    ]);
+
+    const { homeTz } = resolveProfilePrefs(profile);
+    const todayLocal = getLocalYmdInTz(Date.now(), homeTz);
+    const airportMap = new Map(airportList.map((a) => [a.iataCode, a]));
+    const upcoming = allFlights.filter((f) => f.flightDate >= todayLocal);
+
+    for (const f of upcoming) {
+      await ensureRuleRemindersForFlight(db, f, airportMap, profile);
+    }
+
+    const completedFlightIds = new Set(
+      existingJobs.filter((j) => j.status === 'completed').map((j) => j.flightId)
+    );
+    const targets = force ? upcoming : upcoming.filter((f) => !completedFlightIds.has(f.id));
+    const targetIds = targets.map((f) => f.id);
+
+    const { enqueuedIds } = await enqueueFlightsForAnalysis(db, targetIds, { force });
+    if (enqueuedIds.length > 0 && c.env.GEMINI_API_KEY) {
+      runWaitUntil(c, processAnalysisQueueWave(c.env));
+    }
+
+    const status = await getAnalysisStatus(db);
+    if (enqueuedIds.length === 0 && status.queued > 0 && status.running === 0 && c.env.GEMINI_API_KEY) {
+      runWaitUntil(c, processAnalysisQueueWave(c.env));
+    }
+
+    return c.json(
+      {
+        accepted: true,
+        alreadyRunning: enqueuedIds.length === 0 && status.isActive,
+        enqueuedCount: enqueuedIds.length,
+        status,
+      },
+      202
+    );
+  } catch (err: any) {
+    console.error('Error queueing batch reminders:', err);
+    return c.json({ error: err.message || 'Internal Server Error' }, 500);
   }
 });
 
@@ -860,8 +1516,48 @@ export default {
             isPrivate: false,
             publishDelayDays: generatePublishDelayDays(),
             createdAt: new Date(),
-          }).returning({ id: flights.id });
+          }).returning();
           savedCount++;
+
+          let generatedReminders: FlightReminderRow[] = [];
+          if (insertedFlight) {
+            try {
+              const profile = await getOwnerProfile(db);
+              const { homeTz } = resolveProfilePrefs(profile);
+              const todayLocal = getLocalYmdInTz(Date.now(), homeTz);
+              if (insertedFlight.flightDate >= todayLocal) {
+                generatedReminders = await generateRemindersForFlight(db, env, insertedFlight, {
+                  deferSeatToTomorrow: true,
+                });
+                if (env.GEMINI_API_KEY) {
+                  const doneIso = new Date().toISOString();
+                  await db
+                    .insert(flightAnalysisJobs)
+                    .values({
+                      flightId: insertedFlight.id,
+                      status: 'completed',
+                      force: false,
+                      startedAt: null,
+                      completedAt: doneIso,
+                      lastError: null,
+                      updatedAt: doneIso,
+                    })
+                    .onConflictDoUpdate({
+                      target: flightAnalysisJobs.flightId,
+                      set: {
+                        status: 'completed',
+                        startedAt: null,
+                        completedAt: doneIso,
+                        lastError: null,
+                        updatedAt: doneIso,
+                      },
+                    });
+                }
+              }
+            } catch (remErr) {
+              console.error('Pre-flight checklist generation failed on email import:', remErr);
+            }
+          }
 
           if (env.BOT) {
             let depCity: string | null = null;
@@ -884,6 +1580,16 @@ export default {
             }
             if (bookingRef) {
               flightMsg += `\n• *PNR:* \`${bookingRef}\``;
+            }
+
+            const checklistPreview = generatedReminders.filter(
+              (r) => r.category !== 'departure' && r.status === 'pending'
+            );
+            if (checklistPreview.length > 0) {
+              flightMsg += `\n\n📋 *Pre-Flight Checklist:*`;
+              for (const item of checklistPreview.slice(0, 4)) {
+                flightMsg += `\n• ${escapeMd(item.title)}`;
+              }
             }
 
             const cardPublicData = buildFlightCardPublicData({
@@ -913,11 +1619,22 @@ export default {
             if (trimmedPnr.length >= 1 && trimmedPnr.length <= 256) {
               importMarkupRows.push([{ text: `📋 Copy PNR (${trimmedPnr})`, copy_text: { text: trimmedPnr } }]);
             }
-            const importActionRow: any[] = [{ text: '🕒 Upcoming Flights', callback_data: 'flight_next:0' }];
-            if (insertedFlight?.id) {
-              importActionRow.push({ text: '🗑️ Undo Import', callback_data: `flight_del_ask:${insertedFlight.id}` });
+            const seatRem = checklistPreview.find((r) => r.category === 'seat');
+            if (seatRem) {
+              importMarkupRows.push([
+                { text: '✅ Seat Already Selected', callback_data: `rem_done:${seatRem.id}` },
+              ]);
             }
+            const importActionRow: any[] = [
+              { text: '🕒 Upcoming Flights', callback_data: 'flight_next:0' },
+              { text: '📋 Checklist', callback_data: 'rem_list:0' },
+            ];
             importMarkupRows.push(importActionRow);
+            if (insertedFlight?.id) {
+              importMarkupRows.push([
+                { text: '🗑️ Undo Import', callback_data: `flight_del_ask:${insertedFlight.id}` },
+              ]);
+            }
 
             ctx.waitUntil(
               env.BOT.fetch(new Request("http://bot/api/notify-admin", {
@@ -956,63 +1673,11 @@ export default {
       console.error('Email Worker processing failed:', error);
     }
   },
-  async scheduled(event: any, env: Env, ctx: ExecutionContext) {
-    const db = drizzle(env.DB);
-    const today = new Date();
-    const tomorrow = new Date(today);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    
-    const todayStr = today.toISOString().split('T')[0];
-    const tomorrowStr = tomorrow.toISOString().split('T')[0];
-
-    // Find flights departing tomorrow
-    const upcoming = await db.select()
-      .from(flights)
-      .where(eq(flights.flightDate, tomorrowStr))
-      .all();
-
-    if (upcoming.length > 0 && env.BOT) {
-      const airportList = await db.select().from(airports).all();
-      const cityMap = new Map(airportList.map(a => [a.iataCode, a.city]));
-
-      for (const flight of upcoming) {
-        const flightRef = formatFlightRef(flight.airlineIata, flight.flightNumber);
-        const msg = `✈️ *Upcoming Flight Reminder (Tomorrow)*\n\n` +
-          `*Flight*: ${flightRef}\n` +
-          `*Route*: ${flight.depAirportIata} → ${flight.arrAirportIata}\n` +
-          `*Time*: ${flight.depTime || 'TBD'}\n\n` +
-          `Safe travels!`;
-
-        const cardPublicData = buildFlightCardPublicData({
-          kind: 'remind',
-          id: flight.id,
-          flight,
-          depCity: cityMap.get(flight.depAirportIata) ?? null,
-          arrCity: cityMap.get(flight.arrAirportIata) ?? null,
-        });
-
-        const remindRows: any[][] = [];
-        const trimmedPnr = String(flight.bookingRef || '').trim();
-        if (trimmedPnr.length >= 1 && trimmedPnr.length <= 256) {
-          remindRows.push([{ text: `📋 Copy PNR (${trimmedPnr})`, copy_text: { text: trimmedPnr } }]);
-        }
-        remindRows.push([{ text: '🕒 Upcoming Flights', callback_data: 'flight_next:0' }]);
-
-        await env.BOT.fetch(new Request("http://bot/api/notify-admin", {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            html: FLIGHT_CARD_HTML,
-            public_data: cardPublicData,
-            chat_data: '{"del":0}',
-            allow_queries: false,
-            caption: `⏰ Flight Tomorrow: ${flightRef} (${flight.depAirportIata} → ${flight.arrAirportIata} at ${flight.depTime || 'TBD'})`,
-            fallback_text: msg,
-            fallback_parse_mode: 'Markdown',
-            fallback_reply_markup: { inline_keyboard: remindRows },
-          }),
-        }));
-      }
-    }
+  async scheduled(event: any, env: Env, _ctx: ExecutionContext) {
+    const triggerNow =
+      typeof event?.scheduledTime === 'number' && Number.isFinite(event.scheduledTime)
+        ? new Date(event.scheduledTime)
+        : new Date();
+    await runScheduledReminders(env, triggerNow);
   }
 };

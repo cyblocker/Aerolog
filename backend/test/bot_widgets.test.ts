@@ -6,9 +6,17 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { drizzle } from 'drizzle-orm/d1';
 import { eq } from 'drizzle-orm';
-import { airports, flights } from '../src/db/schema';
+import { airports, flightAnalysisJobs, flightReminders, flights, ownerProfile } from '../src/db/schema';
 import { FlightBot, resetWidgetGateCache } from '../src/bot';
-import worker from '../src/index';
+import worker, { app } from '../src/index';
+import { computeCheckinRemindAtUtc } from '../src/utils/time';
+import { buildGoogleCalendarUrl } from '../src/utils/calendar';
+import { runScheduledReminders } from '../src/utils/scheduler';
+import {
+  enqueueFlightsForAnalysis,
+  getAnalysisStatus,
+  processAnalysisQueueWave,
+} from '../src/utils/analysisQueue';
 import {
   AIRPORT_REVIEW_HTML,
   FLIGHT_CARD_HTML,
@@ -57,7 +65,9 @@ function createMemoryD1() {
   const sqlite = new DatabaseSync(':memory:');
   const mig0 = fs.readFileSync(path.resolve('drizzle/0000_typical_spiral.sql'), 'utf8');
   const mig2 = fs.readFileSync(path.resolve('drizzle/0002_add_flight_privacy.sql'), 'utf8');
-  for (const stmt of (mig0 + '\n' + mig2).split(/--> statement-breakpoint|;/)) {
+  const mig3 = fs.readFileSync(path.resolve('drizzle/0003_traveler_profile_and_reminders.sql'), 'utf8');
+  const mig4 = fs.readFileSync(path.resolve('drizzle/0004_async_reminder_analysis.sql'), 'utf8');
+  for (const stmt of (mig0 + '\n' + mig2 + '\n' + mig3 + '\n' + mig4).split(/--> statement-breakpoint|;/)) {
     const trimmed = stmt.trim();
     if (trimmed) sqlite.exec(trimmed);
   }
@@ -311,8 +321,14 @@ test('scheduled cron sends FLIGHT_CARD_HTML widget and sendWidget falls back to 
   const { d1 } = createMemoryD1();
   await seedFlightsAndAirports(d1);
 
+  const todayUtc = new Date().toISOString().split('T')[0];
+  const scheduledMs = Date.parse(`${todayUtc}T10:00:00.000Z`);
   const botMock = makeBotMock();
-  await worker.scheduled({}, { DB: d1, BOT: botMock.fetcher, GEMINI_API_KEY: '', AUTHORIZED_SENDER: '' }, {} as any);
+  await worker.scheduled(
+    { scheduledTime: scheduledMs },
+    { DB: d1, BOT: botMock.fetcher, GEMINI_API_KEY: '', AUTHORIZED_SENDER: '' },
+    {} as any
+  );
   assert.equal(botMock.calls.length, 1);
   assert.match(botMock.calls[0].url, /\/api\/notify-admin$/);
   assert.equal(botMock.calls[0].body.html, FLIGHT_CARD_HTML);
@@ -320,6 +336,15 @@ test('scheduled cron sends FLIGHT_CARD_HTML widget and sendWidget falls back to 
   assert.equal(JSON.parse(botMock.calls[0].body.public_data).fn, 'JL25');
   assert.equal(botMock.calls[0].body.fallback_reply_markup.inline_keyboard[0][0].copy_text.text, 'PNR111');
   assert.equal(botMock.calls[0].body.fallback_reply_markup.inline_keyboard[1][0].callback_data, 'flight_next:0');
+
+  // Second 30-min cron tick must NOT duplicate notification
+  botMock.calls.length = 0;
+  await worker.scheduled(
+    { scheduledTime: scheduledMs + 30 * 60_000 },
+    { DB: d1, BOT: botMock.fetcher, GEMINI_API_KEY: '', AUTHORIZED_SENDER: '' },
+    {} as any
+  );
+  assert.equal(botMock.calls.length, 0);
 
   resetWidgetGateCache();
   const failingBot = makeBotMock({ failSendWidget: true });
@@ -456,4 +481,554 @@ test('non-widget fallback flows: Flight Menu, Prev/Next upcoming navigation, cop
   } finally {
     resetWidgetGateCache();
   }
+});
+
+test('check-in 30-60 min lead window across all minute offsets and daily digest batching', async () => {
+  const minuteCases = [0, 1, 15, 29];
+  const baseDate = dateOffsetDays(5);
+
+  for (const mm of minuteCases) {
+    const { d1 } = createMemoryD1();
+    await seedFlightsAndAirports(d1);
+    const db = drizzle(d1);
+    const allFlights = await db.select().from(flights).all();
+    const ac4 = allFlights.find((f) => f.flightNumber === 'AC4')!;
+
+    const openIso = `${baseDate}T10:${String(mm).padStart(2, '0')}:00.000Z`;
+    const openMs = Date.parse(openIso);
+    const remindIso = computeCheckinRemindAtUtc(openMs);
+
+    await db.insert(flightReminders).values({
+      flightId: ac4.id,
+      category: 'checkin',
+      title: `Online check-in opens (mm=${mm})`,
+      details: 'Choose free bulkhead seats.',
+      actionUrl: 'https://www.aircanada.com/',
+      granularity: 'exact',
+      eventAtUtc: openIso,
+      remindAtUtc: remindIso,
+      status: 'pending',
+      source: 'ai',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    // Simulate 30-min cron ticks from T-90m to T-0m
+    const botMock = makeBotMock();
+    const ticks = [
+      Date.parse(`${baseDate}T08:30:00.000Z`),
+      Date.parse(`${baseDate}T09:00:00.000Z`),
+      Date.parse(`${baseDate}T09:30:00.000Z`),
+      Date.parse(`${baseDate}T10:00:00.000Z`),
+    ];
+
+    let firedAtMs: number | null = null;
+    for (const tickMs of ticks) {
+      const before = botMock.calls.length;
+      await runScheduledReminders(
+        { DB: d1, BOT: botMock.fetcher, AUTHORIZED_CHAT_ID: '123456' },
+        new Date(tickMs)
+      );
+      if (botMock.calls.length > before) {
+        assert.equal(firedAtMs, null, `Check-in mm=${mm} must fire only once`);
+        firedAtMs = tickMs;
+      }
+    }
+
+    assert.notEqual(firedAtMs, null, `Check-in mm=${mm} must fire`);
+    const leadMins = (openMs - firedAtMs!) / 60_000;
+    assert.ok(leadMins >= 30 && leadMins <= 60, `Expected 30-60m lead for mm=${mm}, got ${leadMins}m`);
+    const msgCall = botMock.calls[0];
+    assert.match(msgCall.url, /\/api\/sendMessage$/);
+    assert.equal(msgCall.body.chat_id, '123456');
+    assert.match(msgCall.body.text, /Check-In Window Alert/);
+    const btns = msgCall.body.reply_markup.inline_keyboard.flat();
+    assert.ok(btns.some((b: any) => String(b.url || '').includes('calendar.google.com/calendar/render')));
+    assert.ok(btns.some((b: any) => String(b.callback_data || '').startsWith('rem_snooze:')));
+  }
+
+  // Test daily digest batching + past-flight stale silencing
+  const { d1 } = createMemoryD1();
+  await seedFlightsAndAirports(d1);
+  const db = drizzle(d1);
+  const rows = await db.select().from(flights).all();
+  const futureFlight = rows.find((f) => f.flightNumber === 'AC4')!;
+  const pastFlight = rows.find((f) => f.flightDate < dateOffsetDays(0))!;
+  const dayRemindAt = `${dateOffsetDays(2)}T09:00:00.000Z`;
+
+  await db.insert(flightReminders).values([
+    {
+      flightId: futureFlight.id,
+      category: 'meal',
+      title: 'Book special meal',
+      granularity: 'day',
+      remindAtUtc: dayRemindAt,
+      status: 'pending',
+      source: 'ai',
+    },
+    {
+      flightId: futureFlight.id,
+      category: 'border',
+      title: 'Complete eTA / Arrival card',
+      granularity: 'day',
+      remindAtUtc: dayRemindAt,
+      status: 'pending',
+      source: 'ai',
+    },
+    {
+      flightId: pastFlight.id,
+      category: 'seat',
+      title: 'Stale past flight seat task',
+      granularity: 'day',
+      remindAtUtc: `${dateOffsetDays(-20)}T09:00:00.000Z`,
+      status: 'pending',
+      source: 'rule',
+    },
+  ]);
+
+  const botMock = makeBotMock();
+  const res = await runScheduledReminders(
+    { DB: d1, BOT: botMock.fetcher, AUTHORIZED_CHAT_ID: '123456' },
+    new Date(`${dateOffsetDays(2)}T09:05:00.000Z`)
+  );
+  assert.equal(res.processed, 2);
+  assert.equal(botMock.calls.length, 1, 'Multiple day items should bundle into 1 daily digest');
+  assert.match(botMock.calls[0].body.text, /Daily Pre-Flight Digest/);
+  assert.match(botMock.calls[0].body.text, /Book special meal/);
+  assert.match(botMock.calls[0].body.text, /Complete eTA \/ Arrival card/);
+  assert.ok(!botMock.calls[0].body.text.includes('Stale past flight seat task'));
+
+  // Confirm stale past-flight reminder got notified_at set so next run processes 0
+  const staleCheck = await db.select().from(flightReminders).all();
+  const staleRow = staleCheck.find((r) => r.title === 'Stale past flight seat task')!;
+  assert.ok(staleRow.notifiedAt, 'Stale past-flight reminder should be silenced');
+});
+
+test('Telegram /reminders command, rem_done, rem_dis, rem_snooze callbacks and authorization gate', async () => {
+  const { d1 } = createMemoryD1();
+  await seedFlightsAndAirports(d1);
+  const db = drizzle(d1);
+  const futureFlight = (await db.select().from(flights).all()).find((f) => f.flightNumber === 'AC4')!;
+
+  const inserted = await db
+    .insert(flightReminders)
+    .values([
+      {
+        flightId: futureFlight.id,
+        category: 'seat',
+        title: 'Pick JAL seat',
+        granularity: 'day',
+        remindAtUtc: `${dateOffsetDays(1)}T09:00:00.000Z`,
+        status: 'pending',
+        source: 'rule',
+      },
+      {
+        flightId: futureFlight.id,
+        category: 'checkin',
+        title: 'Online check-in opens',
+        granularity: 'exact',
+        eventAtUtc: `${dateOffsetDays(6)}T10:00:00.000Z`,
+        remindAtUtc: `${dateOffsetDays(6)}T09:00:00.000Z`,
+        status: 'pending',
+        source: 'ai',
+      },
+    ])
+    .returning();
+
+  const botMock = makeBotMock({ failSendWidget: true });
+  const bot = new FlightBot(botMock.fetcher, d1, '123456');
+
+  // Unauthorized /reminders rejected
+  await bot.handleUpdate({ message: { chat: { id: 999999 }, from: { id: 999999 }, text: '/reminders' } });
+  assert.match(botMock.calls[0].body.text, /Unauthorized/i);
+
+  // Authorized /reminders lists pending items with GCal & Done/Dismiss buttons
+  botMock.calls.length = 0;
+  await bot.handleUpdate({ message: { chat: { id: 123456 }, from: { id: 123456 }, text: '/reminders' } });
+  const listCall = botMock.calls.find((c) => c.url.endsWith('/api/sendMessage'));
+  assert.ok(listCall);
+  assert.match(listCall.body.text, /Pre-Flight Checklist \(2 pending\)/);
+  const listBtns = listCall.body.reply_markup.inline_keyboard.flat();
+  assert.ok(listBtns.some((b: any) => b.callback_data === `rem_done:${inserted[0].id}`));
+  assert.ok(listBtns.some((b: any) => String(b.url || '').includes('calendar.google.com')));
+
+  // rem_done marks first item done
+  botMock.calls.length = 0;
+  await bot.handleUpdate({
+    callback_query: {
+      id: 'cb_done',
+      from: { id: 123456 },
+      message: { chat: { id: 123456 }, message_id: 50 },
+      data: `rem_done:${inserted[0].id}`,
+    },
+  });
+  const [doneRow] = await db.select().from(flightReminders).where(eq(flightReminders.id, inserted[0].id));
+  assert.equal(doneRow.status, 'done');
+  assert.ok(doneRow.completedAt);
+
+  // rem_snooze:id:30 shifts remindAtUtc forward and clears notifiedAt
+  await bot.handleUpdate({
+    callback_query: {
+      id: 'cb_snz',
+      from: { id: 123456 },
+      message: { chat: { id: 123456 }, message_id: 51 },
+      data: `rem_snooze:${inserted[1].id}:30`,
+    },
+  });
+  const [snoozedRow] = await db.select().from(flightReminders).where(eq(flightReminders.id, inserted[1].id));
+  assert.equal(snoozedRow.status, 'pending');
+  assert.equal(snoozedRow.notifiedAt, null);
+  assert.ok(Date.parse(snoozedRow.remindAtUtc) > Date.parse(`${dateOffsetDays(6)}T09:00:00.000Z`));
+
+  // rem_dis marks item dismissed
+  await bot.handleUpdate({
+    callback_query: {
+      id: 'cb_dis',
+      from: { id: 123456 },
+      message: { chat: { id: 123456 }, message_id: 52 },
+      data: `rem_dis:${inserted[1].id}`,
+    },
+  });
+  const [disRow] = await db.select().from(flightReminders).where(eq(flightReminders.id, inserted[1].id));
+  assert.equal(disRow.status, 'dismissed');
+});
+
+test('privacy isolation, Traveler Profile API, seat auto-completion & ICS calendar export', async () => {
+  const { d1 } = createMemoryD1();
+  await seedFlightsAndAirports(d1);
+  const env = {
+    DB: d1,
+    GEMINI_API_KEY: '',
+    AUTHORIZED_SENDER: '',
+    DEV_BYPASS_AUTH: 'true',
+  } as any;
+  const noBypassEnv = { DB: d1, GEMINI_API_KEY: '', AUTHORIZED_SENDER: '' } as any;
+
+  // 1. Unauthorized requests to /admin/api/profile or /admin/api/reminders are rejected (both Mode A & Mode B)
+  const unauthProd = await app.request(
+    'https://flights.cyblocker.com/admin/api/profile',
+    {},
+    noBypassEnv
+  );
+  assert.equal(unauthProd.status, 401);
+  const unauthModeA = await app.request(
+    'http://localhost/admin/api/reminders',
+    {},
+    { ...noBypassEnv, CF_ACCESS_TEAM_DOMAIN: 'example.cloudflareaccess.com', CF_ACCESS_AUD: 'aud-tag' }
+  );
+  assert.equal(unauthModeA.status, 401);
+
+  // 2. Owner updates optional profile fields (sensitive citizenship/residency)
+  const putRes = await app.request(
+    'http://localhost/admin/api/profile',
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        citizenships: 'JP',
+        residencyCountry: 'JP',
+        residencyStatus: 'Permanent Resident',
+        homeTimezone: 'Asia/Tokyo',
+        dailyReminderHour: 8,
+      }),
+    },
+    env
+  );
+  assert.equal(putRes.status, 200);
+  const savedProfile: any = await putRes.json();
+  assert.equal(savedProfile.citizenships, 'JP');
+  assert.equal(savedProfile.homeTimezone, 'Asia/Tokyo');
+  assert.equal(savedProfile.dailyReminderHour, 8);
+
+  // Confirm public API never leaks profile or reminder strings
+  const [pubFlights, pubStats] = await Promise.all([
+    app.request('http://localhost/api/flights', {}, noBypassEnv).then((r) => r.text()),
+    app.request('http://localhost/api/stats', {}, noBypassEnv).then((r) => r.text()),
+  ]);
+  assert.ok(!pubFlights.includes('Permanent Resident'));
+  assert.ok(!pubStats.includes('Asia/Tokyo'));
+
+  // 3. Creating flight with blank seat auto-creates rule seat & departure reminders, updating seat auto-completes seat reminder
+  const futureDate = dateOffsetDays(10);
+  const createRes = await app.request(
+    'http://localhost/admin/api/flights',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        flightDate: futureDate,
+        airlineIata: 'LX',
+        flightNumber: 'LX161',
+        depAirportIata: 'HND',
+        arrAirportIata: 'YVR',
+        depTime: '11:00',
+        bookingRef: 'SWISS1',
+        seat: '',
+      }),
+    },
+    env
+  );
+  assert.equal(createRes.status, 201);
+  const createdFlight: any = await createRes.json();
+
+  const listRemRes = await app.request(
+    `http://localhost/admin/api/reminders?flightId=${createdFlight.id}`,
+    {},
+    env
+  );
+  const remsForFlight: any[] = await listRemRes.json();
+  const seatRem = remsForFlight.find((r) => r.category === 'seat');
+  assert.ok(seatRem, 'Seat reminder should be created automatically when seat is empty');
+  assert.equal(seatRem.status, 'pending');
+
+  const updateRes = await app.request(
+    `http://localhost/admin/api/flights/${createdFlight.id}`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ seat: '14A' }),
+    },
+    env
+  );
+  assert.equal(updateRes.status, 200);
+  const updatedFlight: any = await updateRes.json();
+  assert.equal(updatedFlight.autoCompletedSeatReminders, 1);
+
+  const afterSeatList: any[] = await app
+    .request(`http://localhost/admin/api/reminders?flightId=${createdFlight.id}`, {}, env)
+    .then((r) => r.json());
+  assert.equal(afterSeatList.find((r) => r.id === seatRem.id).status, 'done');
+
+  // 4. Custom exact check-in reminder + ICS download + Google Calendar link
+  const customRes = await app.request(
+    'http://localhost/admin/api/reminders',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        flightId: createdFlight.id,
+        category: 'checkin',
+        title: 'SWISS Check-In',
+        details: 'Choose exit row',
+        actionUrl: 'https://www.swiss.com/',
+        granularity: 'exact',
+        eventDate: dateOffsetDays(9),
+        eventTime: '11:00',
+        eventTimezone: 'Asia/Tokyo',
+      }),
+    },
+    env
+  );
+  assert.equal(customRes.status, 201);
+  const customRem: any = await customRes.json();
+  assert.equal(customRem.granularity, 'exact');
+
+  const icsRes = await app.request(`http://localhost/admin/api/reminders/${customRem.id}/ics`, {}, env);
+  assert.equal(icsRes.status, 200);
+  assert.match(icsRes.headers.get('content-type') || '', /text\/calendar/);
+  const icsText = await icsRes.text();
+  assert.match(icsText, /BEGIN:VCALENDAR/);
+  assert.match(icsText, /TRIGGER:-PT30M/);
+  assert.match(icsText, /SUMMARY:LX161: SWISS Check-In/);
+
+  const gcal = buildGoogleCalendarUrl(customRem, 'Asia/Tokyo');
+  assert.match(gcal, /^https:\/\/calendar\.google\.com\/calendar\/render\?/);
+  assert.match(gcal, /dates=\d{8}T\d{6}Z%2F\d{8}T\d{6}Z/);
+});
+
+test('async analysis queue lock, stale lock recovery, empty completion & light-fare seat-to-checkin conversion', async () => {
+  const { d1 } = createMemoryD1();
+  await seedFlightsAndAirports(d1);
+  const db = drizzle(d1);
+  const env = { DB: d1, GEMINI_API_KEY: '', AUTHORIZED_SENDER: '', DEV_BYPASS_AUTH: 'true' } as any;
+  const prodNoAuthEnv = { DB: d1, GEMINI_API_KEY: '', AUTHORIZED_SENDER: '' } as any;
+
+  // 1. Unauthorized GET /admin/api/reminders/analysis-status rejected
+  const unauthStatus = await app.request(
+    'https://flights.cyblocker.com/admin/api/reminders/analysis-status',
+    {},
+    prodNoAuthEnv
+  );
+  assert.equal(unauthStatus.status, 401);
+
+  // 2. Concurrent / duplicate POST /admin/api/reminders/generate-all returns 202 and deduplicates active jobs
+  const gen1Res = await app.request(
+    'http://localhost/admin/api/reminders/generate-all',
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' },
+    env
+  );
+  assert.equal(gen1Res.status, 202);
+  const gen1Body: any = await gen1Res.json();
+  assert.equal(gen1Body.accepted, true);
+  assert.equal(gen1Body.enqueuedCount, 2);
+  assert.equal(gen1Body.status.isActive, true);
+  assert.equal(gen1Body.status.queued, 2);
+
+  // Duplicate trigger while queued skips already-queued flights
+  const gen2Res = await app.request(
+    'http://localhost/admin/api/reminders/generate-all',
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' },
+    env
+  );
+  assert.equal(gen2Res.status, 202);
+  const gen2Body: any = await gen2Res.json();
+  assert.equal(gen2Body.alreadyRunning, true);
+  assert.equal(gen2Body.enqueuedCount, 0);
+
+  // 3. Stale 'running' lock (>2 min old) auto-recovers to 'queued'
+  const allJobs = await db.select().from(flightAnalysisJobs).all();
+  const staleTime = new Date(Date.now() - 3 * 60_000).toISOString();
+  await db
+    .update(flightAnalysisJobs)
+    .set({ status: 'running', startedAt: staleTime, updatedAt: staleTime })
+    .where(eq(flightAnalysisJobs.flightId, allJobs[0].flightId));
+
+  const recoveredStatus = await getAnalysisStatus(db);
+  assert.equal(recoveredStatus.queued, 2);
+  assert.equal(recoveredStatus.running, 0);
+
+  // 4. Empty-result AI completion marks 'completed' so subsequent generate-all (force=false) skips
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    Response.json({
+      candidates: [{ content: { parts: [{ text: '[]' }] } }],
+    })) as any;
+
+  try {
+    const wave = await processAnalysisQueueWave({ DB: d1, GEMINI_API_KEY: 'test-key' });
+    assert.equal(wave.processed, 2);
+    assert.equal(wave.failed, 0);
+    assert.equal(wave.remainingQueued, 0);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+
+  const afterDone = await app.request('http://localhost/admin/api/reminders/analysis-status', {}, env);
+  const afterStatus: any = await afterDone.json();
+  assert.equal(afterStatus.isActive, false);
+  assert.equal(afterStatus.completed, 2);
+
+  const gen3Res = await app.request(
+    'http://localhost/admin/api/reminders/generate-all',
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' },
+    env
+  );
+  const gen3Body: any = await gen3Res.json();
+  assert.equal(gen3Body.enqueuedCount, 0);
+  assert.equal(gen3Body.alreadyRunning, false);
+
+  // 5. Enqueue skip check when running non-stale
+  await db
+    .update(flightAnalysisJobs)
+    .set({ status: 'running', startedAt: new Date().toISOString() })
+    .where(eq(flightAnalysisJobs.flightId, allJobs[0].flightId));
+  const { skippedActiveIds } = await enqueueFlightsForAnalysis(db, [allJobs[0].flightId]);
+  assert.deepEqual(skippedActiveIds, [allJobs[0].flightId]);
+
+  // 6. NH40-style flight (empty seat -> convert-to-checkin API & Telegram rem_to_chk)
+  const nhRes = await app.request(
+    'http://localhost/admin/api/flights',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        flightDate: dateOffsetDays(6),
+        airlineIata: 'NH',
+        flightNumber: 'NH40',
+        depAirportIata: 'HND',
+        arrAirportIata: 'KIX',
+        depTime: '20:20',
+        seat: '',
+      }),
+    },
+    env
+  );
+  const nhFlight: any = await nhRes.json();
+  const nhRems: any[] = await app
+    .request(`http://localhost/admin/api/reminders?flightId=${nhFlight.id}`, {}, env)
+    .then((r) => r.json());
+  const nhSeatRem = nhRems.find((r) => r.category === 'seat');
+  assert.ok(nhSeatRem);
+
+  const convRes = await app.request(
+    `http://localhost/admin/api/reminders/${nhSeatRem.id}/convert-to-checkin`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' },
+    env
+  );
+  assert.equal(convRes.status, 200);
+  const convBody: any = await convRes.json();
+  assert.equal(convBody.created, true);
+  assert.equal(convBody.checkinReminder.category, 'checkin');
+  assert.equal(convBody.checkinReminder.granularity, 'exact');
+  const openMs = Date.parse(convBody.checkinReminder.eventAtUtc);
+  const remMs = Date.parse(convBody.checkinReminder.remindAtUtc);
+  assert.equal(openMs - remMs, 60 * 60_000, 'Remind time must be 60m prior to T-24h check-in open');
+
+  // 7. Light fare note suppresses rule seat reminder & creates check-in reminder automatically
+  const lightRes = await app.request(
+    'http://localhost/admin/api/flights',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        flightDate: dateOffsetDays(8),
+        airlineIata: 'NH',
+        flightNumber: 'NH42',
+        depAirportIata: 'HND',
+        arrAirportIata: 'KIX',
+        depTime: '18:00',
+        seat: '',
+        notes: 'ANA Simple fare - seat at check-in',
+      }),
+    },
+    env
+  );
+  const lightFlight: any = await lightRes.json();
+  const lightRems: any[] = await app
+    .request(`http://localhost/admin/api/reminders?flightId=${lightFlight.id}`, {}, env)
+    .then((r) => r.json());
+  assert.ok(!lightRems.some((r) => r.category === 'seat'), 'Light/Simple fare must not create seat task');
+  assert.ok(
+    lightRems.some((r) => r.category === 'checkin' && r.granularity === 'exact'),
+    'Light/Simple fare should create exact check-in task automatically'
+  );
+
+  // 8. Telegram rem_to_chk callback switches a pending seat task
+  const jlManualFlight = await app
+    .request(
+      'http://localhost/admin/api/flights',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          flightDate: dateOffsetDays(9),
+          airlineIata: 'JL',
+          flightNumber: 'JL111',
+          depAirportIata: 'HND',
+          arrAirportIata: 'KIX',
+          depTime: '15:00',
+          seat: '',
+        }),
+      },
+      env
+    )
+    .then((r) => r.json() as Promise<any>);
+  const jlRems: any[] = await app
+    .request(`http://localhost/admin/api/reminders?flightId=${jlManualFlight.id}`, {}, env)
+    .then((r) => r.json());
+  const jlSeat = jlRems.find((r) => r.category === 'seat')!;
+
+  const botMock = makeBotMock({ failSendWidget: true });
+  const bot = new FlightBot(botMock.fetcher, d1, '123456');
+  await bot.handleUpdate({
+    callback_query: {
+      id: 'cb_conv',
+      from: { id: 123456 },
+      message: { chat: { id: 123456 }, message_id: 77 },
+      data: `rem_to_chk:${jlSeat.id}`,
+    },
+  });
+  const editMsg = botMock.calls.find((c) => c.url.endsWith('/api/editMessageText'));
+  assert.ok(editMsg);
+  assert.match(editMsg.body.text, /Switched to Check-In Reminder/);
 });

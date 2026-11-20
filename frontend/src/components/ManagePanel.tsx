@@ -11,20 +11,26 @@ import {
   Lock,
   Unlock,
   Share2,
+  UserCheck,
 } from 'lucide-react';
-import type { Flight, Airport } from '../types';
+import type { Flight, Airport, OwnerProfile } from '../types';
 import {
   formatFlightRef,
   getFlightPrivacyBadge,
   getUtcTodayStr,
   sortFlightsChronologically,
 } from '../utils/flightFormat';
+import TravelerProfilePanel from './TravelerProfilePanel';
 
 interface Props {
   flights: Flight[];
   airports: Airport[];
+  profile: OwnerProfile | null;
   onDataChange: () => void;
+  onProfileSaved: (saved: OwnerProfile) => void;
   apiBase: string;
+  isOfflineFallback?: boolean;
+  initialSubTab?: 'flights' | 'airports' | 'profile';
   onShareFlight?: (ids: number[]) => void;
 }
 
@@ -59,11 +65,15 @@ const createEmptyFlightForm = (): Partial<Flight> => ({
 const ManagePanel: React.FC<Props> = ({
   flights,
   airports,
+  profile,
   onDataChange,
+  onProfileSaved,
   apiBase,
+  isOfflineFallback = false,
+  initialSubTab = 'flights',
   onShareFlight,
 }) => {
-  const [activeSubTab, setActiveSubTab] = useState<'flights' | 'airports'>('flights');
+  const [activeSubTab, setActiveSubTab] = useState<'flights' | 'airports' | 'profile'>(initialSubTab);
   const [editingFlight, setEditingFlight] = useState<Flight | null>(null);
   const [editingAirport, setEditingAirport] = useState<Airport | null>(null);
   const [isLookingUp, setIsLookingUp] = useState(false);
@@ -363,43 +373,68 @@ const ManagePanel: React.FC<Props> = ({
 
   return (
     <div className="tab-content animate-fade-in">
-      <div style={{ display: 'flex', gap: '1rem', marginBottom: '1.5rem' }}>
+      <div style={{ display: 'flex', gap: '0.65rem', marginBottom: '1.35rem', flexWrap: 'wrap' }}>
         <button
           type="button"
           onClick={() => setActiveSubTab('flights')}
           className={`nav-item ${activeSubTab === 'flights' ? 'active' : ''}`}
           style={{
-            padding: '0.5rem 1.5rem',
+            padding: '0.5rem 1.15rem',
             borderRadius: '12px',
-            background: activeSubTab === 'flights' ? 'rgba(99, 102, 241, 0.1)' : 'transparent',
-            border: 'none',
+            background: activeSubTab === 'flights' ? 'rgba(99, 102, 241, 0.14)' : 'transparent',
+            border: activeSubTab === 'flights' ? '1px solid rgba(99, 102, 241, 0.3)' : '1px solid transparent',
             cursor: 'pointer',
             display: 'flex',
             alignItems: 'center',
-            gap: '0.5rem',
+            gap: '0.45rem',
           }}
         >
-          <Plane size={18} /> Flights
+          <Plane size={17} /> Flights
         </button>
         <button
           type="button"
           onClick={() => setActiveSubTab('airports')}
           className={`nav-item ${activeSubTab === 'airports' ? 'active' : ''}`}
           style={{
-            padding: '0.5rem 1.5rem',
+            padding: '0.5rem 1.15rem',
             borderRadius: '12px',
-            background: activeSubTab === 'airports' ? 'rgba(99, 102, 241, 0.1)' : 'transparent',
-            border: 'none',
+            background: activeSubTab === 'airports' ? 'rgba(99, 102, 241, 0.14)' : 'transparent',
+            border: activeSubTab === 'airports' ? '1px solid rgba(99, 102, 241, 0.3)' : '1px solid transparent',
             cursor: 'pointer',
             display: 'flex',
             alignItems: 'center',
-            gap: '0.5rem',
+            gap: '0.45rem',
           }}
         >
-          <MapPin size={18} /> Airports
+          <MapPin size={17} /> Airports
+        </button>
+        <button
+          type="button"
+          onClick={() => setActiveSubTab('profile')}
+          className={`nav-item ${activeSubTab === 'profile' ? 'active' : ''}`}
+          style={{
+            padding: '0.5rem 1.15rem',
+            borderRadius: '12px',
+            background: activeSubTab === 'profile' ? 'rgba(99, 102, 241, 0.14)' : 'transparent',
+            border: activeSubTab === 'profile' ? '1px solid rgba(99, 102, 241, 0.3)' : '1px solid transparent',
+            cursor: 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.45rem',
+          }}
+        >
+          <UserCheck size={17} /> Traveler Profile
         </button>
       </div>
 
+      {activeSubTab === 'profile' ? (
+        <TravelerProfilePanel
+          profile={profile}
+          apiBase={apiBase}
+          isOfflineFallback={isOfflineFallback}
+          onProfileSaved={onProfileSaved}
+        />
+      ) : (
       <div className="manage-grid">
         {/* ADD / EDIT FORM */}
         <div ref={formCardRef} className="card manage-form-card">
@@ -940,6 +975,7 @@ const ManagePanel: React.FC<Props> = ({
           </div>
         </div>
       </div>
+      )}
 
       <style>{`
         .manage-grid {

@@ -31,3 +31,46 @@ export const airports = sqliteTable('airports', {
   longitude: real('longitude').notNull(),
   timezone: text('timezone'),                            // e.g. Asia/Tokyo
 });
+
+export const ownerProfile = sqliteTable('owner_profile', {
+  id: integer('id').primaryKey(),
+  citizenships: text('citizenships'),
+  residencyCountry: text('residency_country'),
+  residencyStatus: text('residency_status'),
+  visasAndPrograms: text('visas_and_programs'),
+  frequentFlyerStatuses: text('frequent_flyer_statuses'),
+  mealPreferences: text('meal_preferences'),
+  homeTimezone: text('home_timezone'),
+  dailyReminderHour: integer('daily_reminder_hour'),
+  updatedAt: integer('updated_at', { mode: 'timestamp' }),
+});
+
+export const flightReminders = sqliteTable('flight_reminders', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  flightId: integer('flight_id').references(() => flights.id, { onDelete: 'cascade' }),
+  category: text('category').notNull().default('custom'),    // departure | seat | checkin | meal | border | custom
+  title: text('title').notNull(),
+  details: text('details'),
+  actionUrl: text('action_url'),
+  granularity: text('granularity').notNull().default('day'), // day | exact
+  eventAtUtc: text('event_at_utc'),                          // ISO UTC timestamp of actual event/window opening
+  remindAtUtc: text('remind_at_utc').notNull(),              // ISO UTC timestamp when Cron should notify
+  status: text('status').notNull().default('pending'),       // pending | done | dismissed
+  source: text('source').notNull().default('manual'),        // rule | ai | manual
+  notifiedAt: text('notified_at'),
+  completedAt: text('completed_at'),
+  createdAt: integer('created_at', { mode: 'timestamp' }),
+  updatedAt: integer('updated_at', { mode: 'timestamp' }),
+});
+
+export const flightAnalysisJobs = sqliteTable('flight_analysis_jobs', {
+  flightId: integer('flight_id')
+    .primaryKey()
+    .references(() => flights.id, { onDelete: 'cascade' }),
+  status: text('status').notNull().default('queued'),       // queued | running | completed | failed
+  force: integer('force', { mode: 'boolean' }).notNull().default(false),
+  startedAt: text('started_at'),
+  completedAt: text('completed_at'),
+  lastError: text('last_error'),
+  updatedAt: text('updated_at').notNull(),
+});

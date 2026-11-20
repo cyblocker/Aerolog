@@ -1,6 +1,6 @@
 import { drizzle } from 'drizzle-orm/d1';
 import { eq, desc, asc, sql } from 'drizzle-orm';
-import { flights, airports } from './db/schema';
+import { flights, airports, flightReminders, flightAnalysisJobs } from './db/schema';
 import {
   FLIGHT_DASHBOARD_HTML,
   buildFlightListData,
@@ -9,6 +9,13 @@ import {
   formatFlightRef,
   type FlightRecord,
 } from './widgets';
+import { buildGoogleCalendarUrl, sanitizeHttpsUrl } from './utils/calendar';
+import {
+  convertSeatReminderToCheckin,
+  getOwnerProfile,
+  resolveProfilePrefs,
+} from './utils/logistics';
+import { formatLocalDateTime, getLocalYmdInTz } from './utils/time';
 
 const WIDGET_GATE_COOLDOWN_MS = 10 * 60 * 1000;
 let widgetBlockedUntil = 0;
@@ -182,7 +189,7 @@ export class FlightBot {
           });
         } else if (payload.message?.chat?.id) {
           const lowerText = String(payload.message.text || '').trim().toLowerCase();
-          if (lowerText.startsWith('/flight')) {
+          if (lowerText.startsWith('/flight') || lowerText.startsWith('/reminders')) {
             await this.callApi('sendMessage', {
               chat_id: payload.message.chat.id,
               text: '⛔ Unauthorized access.',
@@ -273,6 +280,8 @@ export class FlightBot {
       const id = parseInt(data.slice('flight:del:'.length), 10);
       if (!Number.isNaN(id)) {
         const db = drizzle(this.db);
+        await db.delete(flightAnalysisJobs).where(eq(flightAnalysisJobs.flightId, id));
+        await db.delete(flightReminders).where(eq(flightReminders.flightId, id));
         await db.delete(flights).where(eq(flights.id, id));
       }
       const deletedState = '{"del":1}';
@@ -367,10 +376,38 @@ export class FlightBot {
       const id = parseInt(raw.slice('flight_del:'.length), 10);
       if (Number.isFinite(id)) {
         const db = drizzle(this.db);
+        await db.delete(flightAnalysisJobs).where(eq(flightAnalysisJobs.flightId, id));
+        await db.delete(flightReminders).where(eq(flightReminders.flightId, id));
         await db.delete(flights).where(eq(flights.id, id));
         await this.editOrSendText(chatId, messageId, `🗑️ Flight record #${id} has been deleted.`, {
           inline_keyboard: [[{ text: '⬅️ Flight Menu', callback_data: 'flight_menu' }]],
         });
+      }
+    } else if (lower === 'rem_list' || lower.startsWith('rem_list:')) {
+      const parts = lower.split(':');
+      const page = parts.length > 1 ? (parseInt(parts[1], 10) || 0) : 0;
+      await this.sendRemindersDashboard(chatId, page, messageId);
+    } else if (lower.startsWith('rem_done:')) {
+      const id = parseInt(raw.slice('rem_done:'.length), 10);
+      if (Number.isFinite(id)) {
+        await this.handleReminderStatus(chatId, messageId, id, 'done');
+      }
+    } else if (lower.startsWith('rem_dis:')) {
+      const id = parseInt(raw.slice('rem_dis:'.length), 10);
+      if (Number.isFinite(id)) {
+        await this.handleReminderStatus(chatId, messageId, id, 'dismissed');
+      }
+    } else if (lower.startsWith('rem_to_chk:')) {
+      const id = parseInt(raw.slice('rem_to_chk:'.length), 10);
+      if (Number.isFinite(id)) {
+        await this.handleConvertSeatToCheckin(chatId, messageId, id);
+      }
+    } else if (lower.startsWith('rem_snooze:')) {
+      const parts = raw.slice('rem_snooze:'.length).split(':');
+      const id = parseInt(parts[0] || '', 10);
+      const mins = parseInt(parts[1] || '30', 10);
+      if (Number.isFinite(id)) {
+        await this.handleReminderSnooze(chatId, messageId, id, mins);
       }
     } else if (lower === 'flight_del_cancel') {
       await this.editOrSendText(chatId, messageId, 'Cancelled. Flight record was kept.', {
@@ -406,7 +443,9 @@ export class FlightBot {
       return;
     }
 
-    if (lower === '/flight' || lower.startsWith('/flight@') || lower === 'flight_menu') {
+    if (lower === '/reminders' || lower.startsWith('/reminders@') || lower.startsWith('/flight_reminders')) {
+      await this.sendRemindersDashboard(chatId, 0);
+    } else if (lower === '/flight' || lower.startsWith('/flight@') || lower === 'flight_menu') {
       await this.sendFlightMenu(chatId);
     } else if (lower.startsWith('/flight_stats')) {
       await this.sendStatsDashboard(chatId);
@@ -439,6 +478,7 @@ export class FlightBot {
     const menuMarkup = {
       inline_keyboard: [
         [{ text: `🕒 Upcoming Flights (${up.upcomingCount})`, callback_data: 'flight_next:0' }],
+        [{ text: '📋 Pre-Flight Checklist', callback_data: 'rem_list:0' }],
         [
           { text: '📊 Travel Statistics', callback_data: 'flight_stats' },
           { text: '📜 Recent Flight History', callback_data: 'flight_recent:0' },
@@ -459,6 +499,242 @@ export class FlightBot {
       fallbackText: menuText,
       fallbackMarkup: menuMarkup,
     });
+  }
+
+  private async sendRemindersDashboard(chatId: number | string, page: number, messageId?: number) {
+    const db = drizzle(this.db);
+    const [pendingRows, flightRows, profile] = await Promise.all([
+      db
+        .select()
+        .from(flightReminders)
+        .where(eq(flightReminders.status, 'pending'))
+        .orderBy(asc(flightReminders.remindAtUtc), asc(flightReminders.id))
+        .all(),
+      db.select().from(flights).all(),
+      getOwnerProfile(db),
+    ]);
+
+    const { homeTz } = resolveProfilePrefs(profile);
+    const todayLocal = getLocalYmdInTz(Date.now(), homeTz);
+    const flightMap = new Map(flightRows.map((f) => [f.id, f]));
+
+    const active = pendingRows.filter((r) => {
+      if (r.category === 'departure') return false;
+      if (r.flightId) {
+        const f = flightMap.get(r.flightId);
+        if (f && f.flightDate < todayLocal) return false;
+      }
+      return true;
+    });
+
+    if (active.length === 0) {
+      await this.editOrSendText(
+        chatId,
+        messageId,
+        '📋 *Pre-Flight Checklist*\n\nAll caught up! No pending reminders right now.',
+        {
+          inline_keyboard: [
+            [{ text: '🕒 Upcoming Flights', callback_data: 'flight_next:0' }],
+            [{ text: '⬅️ Back to Menu', callback_data: 'flight_menu' }],
+          ],
+        }
+      );
+      return;
+    }
+
+    const catEmoji = (cat: string) => {
+      switch (cat) {
+        case 'seat': return '💺';
+        case 'meal': return '🍽';
+        case 'border': return '🛂';
+        case 'checkin': return '🛎';
+        default: return '📌';
+      }
+    };
+
+    const pageSize = 5;
+    const totalPages = Math.max(1, Math.ceil(active.length / pageSize));
+    const safePage = Math.max(0, Math.min(page, totalPages - 1));
+    const items = active.slice(safePage * pageSize, (safePage + 1) * pageSize);
+
+    let text = `📋 *Pre-Flight Checklist (${active.length} pending${totalPages > 1 ? ` • Page ${safePage + 1}/${totalPages}` : ''})*\n\n`;
+    const rows: any[][] = [];
+
+    for (const r of items) {
+      const f = r.flightId ? flightMap.get(r.flightId) : undefined;
+      const fRef = f ? formatFlightRef(f.airlineIata, f.flightNumber) : null;
+      const routeTag = f && fRef ? `${fRef} (${f.depAirportIata}→${f.arrAirportIata})` : 'General';
+      const whenLabel =
+        r.granularity === 'exact'
+          ? `Opens ${formatLocalDateTime(r.eventAtUtc || r.remindAtUtc, homeTz)}`
+          : `Due ${getLocalYmdInTz(Date.parse(r.remindAtUtc) || Date.now(), homeTz)}`;
+
+      text += `${catEmoji(r.category)} *${escapeMd(r.title)}*\n`;
+      text += `   ${escapeMd(routeTag)} • _${escapeMd(whenLabel)}_\n`;
+      const safeUrl = sanitizeHttpsUrl(r.actionUrl);
+      if (safeUrl) {
+        text += `   [Open Portal](${safeUrl})\n`;
+      }
+
+      const shortTitle = r.title.length > 20 ? r.title.slice(0, 19) + '…' : r.title;
+      rows.push([
+        { text: `✅ ${shortTitle}`, callback_data: `rem_done:${r.id}` },
+        { text: '❌', callback_data: `rem_dis:${r.id}` },
+      ]);
+
+      if (r.category === 'seat' && r.flightId !== null) {
+        rows.push([{ text: '🛎 Seat at Check-In', callback_data: `rem_to_chk:${r.id}` }]);
+      }
+
+      if (r.granularity === 'exact' || r.category === 'checkin') {
+        const gcalUrl = buildGoogleCalendarUrl({
+          title: fRef ? `${fRef}: ${r.title}` : r.title,
+          details: r.details,
+          actionUrl: r.actionUrl,
+          granularity: r.granularity,
+          eventAtUtc: r.eventAtUtc,
+          remindAtUtc: r.remindAtUtc,
+          homeTz,
+        });
+        rows.push([{ text: `📅 Calendar: ${shortTitle}`, url: gcalUrl }]);
+      }
+    }
+
+    if (totalPages > 1) {
+      const navRow: any[] = [];
+      if (safePage > 0) navRow.push({ text: '⬅️ Prev', callback_data: `rem_list:${safePage - 1}` });
+      navRow.push({ text: `${safePage + 1}/${totalPages}`, callback_data: 'flight_noop' });
+      if (safePage < totalPages - 1) navRow.push({ text: 'Next ➡️', callback_data: `rem_list:${safePage + 1}` });
+      rows.push(navRow);
+    }
+
+    rows.push([
+      { text: '🕒 Upcoming Flights', callback_data: 'flight_next:0' },
+      { text: '⬅️ Back to Menu', callback_data: 'flight_menu' },
+    ]);
+
+    await this.editOrSendText(chatId, messageId, text, { inline_keyboard: rows });
+  }
+
+  private async handleConvertSeatToCheckin(
+    chatId: number | string,
+    messageId: number | undefined,
+    id: number
+  ) {
+    const db = drizzle(this.db);
+    const res = await convertSeatReminderToCheckin(db, id);
+    if (!res.ok) {
+      await this.editOrSendText(chatId, messageId, `Could not convert reminder: ${escapeMd(res.error)}`, {
+        inline_keyboard: [[{ text: '📋 View Checklist', callback_data: 'rem_list:0' }]],
+      });
+      return;
+    }
+
+    const profile = await getOwnerProfile(db);
+    const { homeTz } = resolveProfilePrefs(profile);
+    const whenIso = res.checkinReminder.eventAtUtc || res.checkinReminder.remindAtUtc;
+    const msg =
+      `🛎 *Switched to Check-In Reminder*\n\n` +
+      `*Task:* ${escapeMd(res.checkinReminder.title)}\n` +
+      `*Window / Alert:* ${escapeMd(formatLocalDateTime(whenIso, homeTz))}`;
+
+    await this.editOrSendText(chatId, messageId, msg, {
+      inline_keyboard: [
+        [
+          { text: '📋 View Checklist', callback_data: 'rem_list:0' },
+          { text: '⬅️ Flight Menu', callback_data: 'flight_menu' },
+        ],
+      ],
+    });
+  }
+
+  private async handleReminderStatus(
+    chatId: number | string,
+    messageId: number | undefined,
+    id: number,
+    status: 'done' | 'dismissed'
+  ) {
+    const db = drizzle(this.db);
+    const [existing] = await db.select().from(flightReminders).where(eq(flightReminders.id, id)).limit(1);
+    if (!existing) {
+      await this.editOrSendText(chatId, messageId, 'Reminder not found.', {
+        inline_keyboard: [[{ text: '📋 View Checklist', callback_data: 'rem_list:0' }]],
+      });
+      return;
+    }
+
+    const now = new Date();
+    await db
+      .update(flightReminders)
+      .set({
+        status,
+        completedAt: now.toISOString(),
+        updatedAt: now,
+      })
+      .where(eq(flightReminders.id, id));
+
+    const label = status === 'done' ? '✅ Completed' : '❌ Dismissed';
+    await this.editOrSendText(
+      chatId,
+      messageId,
+      `${label}: *${escapeMd(existing.title)}*`,
+      {
+        inline_keyboard: [
+          [
+            { text: '📋 View Checklist', callback_data: 'rem_list:0' },
+            { text: '⬅️ Flight Menu', callback_data: 'flight_menu' },
+          ],
+        ],
+      }
+    );
+  }
+
+  private async handleReminderSnooze(
+    chatId: number | string,
+    messageId: number | undefined,
+    id: number,
+    rawMins: number
+  ) {
+    const db = drizzle(this.db);
+    const [existing] = await db.select().from(flightReminders).where(eq(flightReminders.id, id)).limit(1);
+    if (!existing) {
+      await this.editOrSendText(chatId, messageId, 'Reminder not found.', {
+        inline_keyboard: [[{ text: '📋 View Checklist', callback_data: 'rem_list:0' }]],
+      });
+      return;
+    }
+
+    const mins = Math.max(5, Math.min(1440, Number.isFinite(rawMins) ? rawMins : 30));
+    const now = new Date();
+    const baseMs = Math.max(now.getTime(), Date.parse(existing.remindAtUtc) || now.getTime());
+    const nextIso = new Date(baseMs + mins * 60_000).toISOString();
+
+    await db
+      .update(flightReminders)
+      .set({
+        status: 'pending',
+        remindAtUtc: nextIso,
+        notifiedAt: null,
+        completedAt: null,
+        updatedAt: now,
+      })
+      .where(eq(flightReminders.id, id));
+
+    const profile = await getOwnerProfile(db);
+    const { homeTz } = resolveProfilePrefs(profile);
+    await this.editOrSendText(
+      chatId,
+      messageId,
+      `⏰ Snoozed *${escapeMd(existing.title)}* by ${mins} min.\nNext alert: *${escapeMd(formatLocalDateTime(nextIso, homeTz))}*`,
+      {
+        inline_keyboard: [
+          [
+            { text: '📋 View Checklist', callback_data: 'rem_list:0' },
+            { text: '⬅️ Flight Menu', callback_data: 'flight_menu' },
+          ],
+        ],
+      }
+    );
   }
 
   private async sendUpcomingDashboard(chatId: number | string, offset: number, messageId?: number) {
