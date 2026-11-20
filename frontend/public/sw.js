@@ -1,8 +1,12 @@
-const CACHE_NAME = 'aerolog-shell-v6';
+const CACHE_NAME = 'aerolog-shell-v7';
 const SHELL_ASSETS = [
   '/',
   '/index.html',
   '/favicon.svg',
+  '/icon-192.png',
+  '/icon-512.png',
+  '/icon-maskable-512.png',
+  '/apple-touch-icon.png',
   '/manifest.webmanifest',
   '/manifest-admin.webmanifest',
 ];
@@ -70,6 +74,10 @@ self.addEventListener('fetch', (event) => {
   if (
     url.pathname.startsWith('/assets/') ||
     url.pathname === '/favicon.svg' ||
+    url.pathname === '/icon-192.png' ||
+    url.pathname === '/icon-512.png' ||
+    url.pathname === '/icon-maskable-512.png' ||
+    url.pathname === '/apple-touch-icon.png' ||
     url.pathname.endsWith('.webmanifest')
   ) {
     event.respondWith(
