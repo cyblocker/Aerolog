@@ -297,7 +297,7 @@ export async function runScheduledReminders(
     }
     remindRows.push([{ text: '🕒 Upcoming Flights', callback_data: 'flight_next:0' }]);
     if (otherPending.length > 0) {
-      remindRows.push([{ text: `📋 Checklist (${otherPending.length})`, callback_data: 'rem_list:0' }]);
+      remindRows.push([{ text: `📋 Checklist (${otherPending.length})`, callback_data: 'flight_rem_list:0' }]);
     }
 
     try {
@@ -382,9 +382,9 @@ export async function runScheduledReminders(
     linkRow.push({ text: '📅 Google Calendar', url: gcalUrl });
     rows.push(linkRow);
     rows.push([
-      { text: '✅ Done', callback_data: `rem_done:${rem.id}` },
-      { text: '⏰ +30m', callback_data: `rem_snooze:${rem.id}:30` },
-      { text: '❌ Dismiss', callback_data: `rem_dis:${rem.id}` },
+      { text: '✅ Done', callback_data: `flight_rem_done:${rem.id}` },
+      { text: '⏰ +30m', callback_data: `flight_rem_snooze:${rem.id}:30` },
+      { text: '❌ Dismiss', callback_data: `flight_rem_dis:${rem.id}` },
     ]);
 
     const ok = await sendBotMessage(env, text, { inline_keyboard: rows });
@@ -422,7 +422,7 @@ export async function runScheduledReminders(
         }
         const safeUrl = sanitizeHttpsUrl(item.actionUrl);
         if (safeUrl) {
-          digestText += `  [Official Portal](${safeUrl})\n`;
+          digestText += `  [Official Portal](${safeUrl.replace(/\)/g, '%29')})\n`;
         }
       }
     }
@@ -434,10 +434,10 @@ export async function runScheduledReminders(
     const digestRows: any[][] = dayReminders.slice(0, 6).map((rem) => [
       {
         text: `✅ Done: ${truncateLabel(rem.title, 26)}`,
-        callback_data: `rem_done:${rem.id}`,
+        callback_data: `flight_rem_done:${rem.id}`,
       },
     ]);
-    digestRows.push([{ text: '📋 View Full Checklist', callback_data: 'rem_list:0' }]);
+    digestRows.push([{ text: '📋 View Full Checklist', callback_data: 'flight_rem_list:0' }]);
 
     const ok = await sendBotMessage(env, digestText, { inline_keyboard: digestRows });
     if (ok) {

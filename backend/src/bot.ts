@@ -325,6 +325,9 @@ export class FlightBot {
     const messageId = cb.message?.message_id as number | undefined;
     const raw = String(cb.data || '');
     const lower = raw.toLowerCase();
+    const isFlightRem = lower.startsWith('flight_rem_');
+    const remLower = isFlightRem ? lower.slice('flight_'.length) : lower;
+    const remRaw = isFlightRem ? raw.slice('flight_'.length) : raw;
 
     if (cb.id) {
       await this.callApi('answerCallbackQuery', { callback_query_id: cb.id });
@@ -383,27 +386,27 @@ export class FlightBot {
           inline_keyboard: [[{ text: '⬅️ Flight Menu', callback_data: 'flight_menu' }]],
         });
       }
-    } else if (lower === 'rem_list' || lower.startsWith('rem_list:')) {
-      const parts = lower.split(':');
+    } else if (remLower === 'rem_list' || remLower.startsWith('rem_list:')) {
+      const parts = remLower.split(':');
       const page = parts.length > 1 ? (parseInt(parts[1], 10) || 0) : 0;
       await this.sendRemindersDashboard(chatId, page, messageId);
-    } else if (lower.startsWith('rem_done:')) {
-      const id = parseInt(raw.slice('rem_done:'.length), 10);
+    } else if (remLower.startsWith('rem_done:')) {
+      const id = parseInt(remRaw.slice('rem_done:'.length), 10);
       if (Number.isFinite(id)) {
         await this.handleReminderStatus(chatId, messageId, id, 'done');
       }
-    } else if (lower.startsWith('rem_dis:')) {
-      const id = parseInt(raw.slice('rem_dis:'.length), 10);
+    } else if (remLower.startsWith('rem_dis:')) {
+      const id = parseInt(remRaw.slice('rem_dis:'.length), 10);
       if (Number.isFinite(id)) {
         await this.handleReminderStatus(chatId, messageId, id, 'dismissed');
       }
-    } else if (lower.startsWith('rem_to_chk:')) {
-      const id = parseInt(raw.slice('rem_to_chk:'.length), 10);
+    } else if (remLower.startsWith('rem_to_chk:')) {
+      const id = parseInt(remRaw.slice('rem_to_chk:'.length), 10);
       if (Number.isFinite(id)) {
         await this.handleConvertSeatToCheckin(chatId, messageId, id);
       }
-    } else if (lower.startsWith('rem_snooze:')) {
-      const parts = raw.slice('rem_snooze:'.length).split(':');
+    } else if (remLower.startsWith('rem_snooze:')) {
+      const parts = remRaw.slice('rem_snooze:'.length).split(':');
       const id = parseInt(parts[0] || '', 10);
       const mins = parseInt(parts[1] || '30', 10);
       if (Number.isFinite(id)) {
@@ -443,7 +446,12 @@ export class FlightBot {
       return;
     }
 
-    if (lower === '/reminders' || lower.startsWith('/reminders@') || lower.startsWith('/flight_reminders')) {
+    if (
+      lower === '/reminders' ||
+      lower.startsWith('/reminders@') ||
+      lower.startsWith('/flight_reminders') ||
+      lower.startsWith('/flight_checklist')
+    ) {
       await this.sendRemindersDashboard(chatId, 0);
     } else if (lower === '/flight' || lower.startsWith('/flight@') || lower === 'flight_menu') {
       await this.sendFlightMenu(chatId);
@@ -478,7 +486,7 @@ export class FlightBot {
     const menuMarkup = {
       inline_keyboard: [
         [{ text: `🕒 Upcoming Flights (${up.upcomingCount})`, callback_data: 'flight_next:0' }],
-        [{ text: '📋 Pre-Flight Checklist', callback_data: 'rem_list:0' }],
+        [{ text: '📋 Pre-Flight Checklist', callback_data: 'flight_rem_list:0' }],
         [
           { text: '📊 Travel Statistics', callback_data: 'flight_stats' },
           { text: '📜 Recent Flight History', callback_data: 'flight_recent:0' },
@@ -573,17 +581,17 @@ export class FlightBot {
       text += `   ${escapeMd(routeTag)} • _${escapeMd(whenLabel)}_\n`;
       const safeUrl = sanitizeHttpsUrl(r.actionUrl);
       if (safeUrl) {
-        text += `   [Open Portal](${safeUrl})\n`;
+        text += `   [Open Portal](${safeUrl.replace(/\)/g, '%29')})\n`;
       }
 
       const shortTitle = r.title.length > 20 ? r.title.slice(0, 19) + '…' : r.title;
       rows.push([
-        { text: `✅ ${shortTitle}`, callback_data: `rem_done:${r.id}` },
-        { text: '❌', callback_data: `rem_dis:${r.id}` },
+        { text: `✅ ${shortTitle}`, callback_data: `flight_rem_done:${r.id}` },
+        { text: '❌', callback_data: `flight_rem_dis:${r.id}` },
       ]);
 
       if (r.category === 'seat' && r.flightId !== null) {
-        rows.push([{ text: '🛎 Seat at Check-In', callback_data: `rem_to_chk:${r.id}` }]);
+        rows.push([{ text: '🛎 Seat at Check-In', callback_data: `flight_rem_to_chk:${r.id}` }]);
       }
 
       if (r.granularity === 'exact' || r.category === 'checkin') {
@@ -602,9 +610,9 @@ export class FlightBot {
 
     if (totalPages > 1) {
       const navRow: any[] = [];
-      if (safePage > 0) navRow.push({ text: '⬅️ Prev', callback_data: `rem_list:${safePage - 1}` });
+      if (safePage > 0) navRow.push({ text: '⬅️ Prev', callback_data: `flight_rem_list:${safePage - 1}` });
       navRow.push({ text: `${safePage + 1}/${totalPages}`, callback_data: 'flight_noop' });
-      if (safePage < totalPages - 1) navRow.push({ text: 'Next ➡️', callback_data: `rem_list:${safePage + 1}` });
+      if (safePage < totalPages - 1) navRow.push({ text: 'Next ➡️', callback_data: `flight_rem_list:${safePage + 1}` });
       rows.push(navRow);
     }
 
@@ -625,7 +633,7 @@ export class FlightBot {
     const res = await convertSeatReminderToCheckin(db, id);
     if (!res.ok) {
       await this.editOrSendText(chatId, messageId, `Could not convert reminder: ${escapeMd(res.error)}`, {
-        inline_keyboard: [[{ text: '📋 View Checklist', callback_data: 'rem_list:0' }]],
+        inline_keyboard: [[{ text: '📋 View Checklist', callback_data: 'flight_rem_list:0' }]],
       });
       return;
     }
@@ -641,7 +649,7 @@ export class FlightBot {
     await this.editOrSendText(chatId, messageId, msg, {
       inline_keyboard: [
         [
-          { text: '📋 View Checklist', callback_data: 'rem_list:0' },
+          { text: '📋 View Checklist', callback_data: 'flight_rem_list:0' },
           { text: '⬅️ Flight Menu', callback_data: 'flight_menu' },
         ],
       ],
@@ -658,7 +666,7 @@ export class FlightBot {
     const [existing] = await db.select().from(flightReminders).where(eq(flightReminders.id, id)).limit(1);
     if (!existing) {
       await this.editOrSendText(chatId, messageId, 'Reminder not found.', {
-        inline_keyboard: [[{ text: '📋 View Checklist', callback_data: 'rem_list:0' }]],
+        inline_keyboard: [[{ text: '📋 View Checklist', callback_data: 'flight_rem_list:0' }]],
       });
       return;
     }
@@ -681,7 +689,7 @@ export class FlightBot {
       {
         inline_keyboard: [
           [
-            { text: '📋 View Checklist', callback_data: 'rem_list:0' },
+            { text: '📋 View Checklist', callback_data: 'flight_rem_list:0' },
             { text: '⬅️ Flight Menu', callback_data: 'flight_menu' },
           ],
         ],
@@ -699,7 +707,7 @@ export class FlightBot {
     const [existing] = await db.select().from(flightReminders).where(eq(flightReminders.id, id)).limit(1);
     if (!existing) {
       await this.editOrSendText(chatId, messageId, 'Reminder not found.', {
-        inline_keyboard: [[{ text: '📋 View Checklist', callback_data: 'rem_list:0' }]],
+        inline_keyboard: [[{ text: '📋 View Checklist', callback_data: 'flight_rem_list:0' }]],
       });
       return;
     }
@@ -729,7 +737,7 @@ export class FlightBot {
       {
         inline_keyboard: [
           [
-            { text: '📋 View Checklist', callback_data: 'rem_list:0' },
+            { text: '📋 View Checklist', callback_data: 'flight_rem_list:0' },
             { text: '⬅️ Flight Menu', callback_data: 'flight_menu' },
           ],
         ],

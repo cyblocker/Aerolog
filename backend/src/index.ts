@@ -1622,12 +1622,12 @@ export default {
             const seatRem = checklistPreview.find((r) => r.category === 'seat');
             if (seatRem) {
               importMarkupRows.push([
-                { text: '✅ Seat Already Selected', callback_data: `rem_done:${seatRem.id}` },
+                { text: '✅ Seat Already Selected', callback_data: `flight_rem_done:${seatRem.id}` },
               ]);
             }
             const importActionRow: any[] = [
               { text: '🕒 Upcoming Flights', callback_data: 'flight_next:0' },
-              { text: '📋 Checklist', callback_data: 'rem_list:0' },
+              { text: '📋 Checklist', callback_data: 'flight_rem_list:0' },
             ];
             importMarkupRows.push(importActionRow);
             if (insertedFlight?.id) {

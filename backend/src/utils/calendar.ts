@@ -38,7 +38,10 @@ export function buildGoogleCalendarUrl(params: {
   homeTz?: string | null;
 }): string {
   const safeUrl = sanitizeHttpsUrl(params.actionUrl);
-  const descParts = [params.details?.trim(), safeUrl ? `Link: ${safeUrl}` : null].filter(Boolean);
+  const rawDetails = params.details?.trim() || '';
+  const cappedDetails =
+    rawDetails.length > 400 ? `${rawDetails.slice(0, 399)}…` : rawDetails;
+  const descParts = [cappedDetails || null, safeUrl ? `Link: ${safeUrl}` : null].filter(Boolean);
   const url = new URL('https://calendar.google.com/calendar/render');
   url.searchParams.set('action', 'TEMPLATE');
   url.searchParams.set('text', params.title.trim() || 'AeroLog Reminder');

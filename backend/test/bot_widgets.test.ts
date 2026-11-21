@@ -544,7 +544,13 @@ test('check-in 30-60 min lead window across all minute offsets and daily digest 
     assert.match(msgCall.body.text, /Check-In Window Alert/);
     const btns = msgCall.body.reply_markup.inline_keyboard.flat();
     assert.ok(btns.some((b: any) => String(b.url || '').includes('calendar.google.com/calendar/render')));
-    assert.ok(btns.some((b: any) => String(b.callback_data || '').startsWith('rem_snooze:')));
+    assert.ok(btns.some((b: any) => String(b.callback_data || '').startsWith('flight_rem_snooze:')));
+    for (const btn of btns) {
+      if (btn.callback_data) {
+        assert.match(btn.callback_data, /^(flight_|airport:)/, `Invalid callback prefix: ${btn.callback_data}`);
+        assert.ok(Buffer.byteLength(btn.callback_data, 'utf8') <= 64);
+      }
+    }
   }
 
   // Test daily digest batching + past-flight stale silencing
@@ -597,6 +603,13 @@ test('check-in 30-60 min lead window across all minute offsets and daily digest 
   assert.match(botMock.calls[0].body.text, /Book special meal/);
   assert.match(botMock.calls[0].body.text, /Complete eTA \/ Arrival card/);
   assert.ok(!botMock.calls[0].body.text.includes('Stale past flight seat task'));
+  const digestBtns = botMock.calls[0].body.reply_markup.inline_keyboard.flat();
+  for (const btn of digestBtns) {
+    if (btn.callback_data) {
+      assert.match(btn.callback_data, /^(flight_|airport:)/, `Invalid digest callback prefix: ${btn.callback_data}`);
+      assert.ok(Buffer.byteLength(btn.callback_data, 'utf8') <= 64);
+    }
+  }
 
   // Confirm stale past-flight reminder got notified_at set so next run processes 0
   const staleCheck = await db.select().from(flightReminders).all();
@@ -604,7 +617,7 @@ test('check-in 30-60 min lead window across all minute offsets and daily digest 
   assert.ok(staleRow.notifiedAt, 'Stale past-flight reminder should be silenced');
 });
 
-test('Telegram /reminders command, rem_done, rem_dis, rem_snooze callbacks and authorization gate', async () => {
+test('Telegram /flight checklist menu button, /flight_checklist, /reminders & flight_rem_* callbacks', async () => {
   const { d1 } = createMemoryD1();
   await seedFlightsAndAirports(d1);
   const db = drizzle(d1);
@@ -626,6 +639,8 @@ test('Telegram /reminders command, rem_done, rem_dis, rem_snooze callbacks and a
         flightId: futureFlight.id,
         category: 'checkin',
         title: 'Online check-in opens',
+        details: 'A'.repeat(500),
+        actionUrl: 'https://example.com/checkin(test)',
         granularity: 'exact',
         eventAtUtc: `${dateOffsetDays(6)}T10:00:00.000Z`,
         remindAtUtc: `${dateOffsetDays(6)}T09:00:00.000Z`,
@@ -638,41 +653,85 @@ test('Telegram /reminders command, rem_done, rem_dis, rem_snooze callbacks and a
   const botMock = makeBotMock({ failSendWidget: true });
   const bot = new FlightBot(botMock.fetcher, d1, '123456');
 
+  const assertValidCallbackButtons = (replyMarkup: any) => {
+    const allBtns = replyMarkup?.inline_keyboard?.flat() || [];
+    for (const b of allBtns) {
+      if (b.callback_data) {
+        assert.match(
+          b.callback_data,
+          /^(flight_|airport:)/,
+          `Callback data must use router-forwarded prefix: ${b.callback_data}`
+        );
+        assert.ok(Buffer.byteLength(b.callback_data, 'utf8') <= 64, `Callback exceeds 64B: ${b.callback_data}`);
+      }
+    }
+    return allBtns;
+  };
+
   // Unauthorized /reminders rejected
   await bot.handleUpdate({ message: { chat: { id: 999999 }, from: { id: 999999 }, text: '/reminders' } });
   assert.match(botMock.calls[0].body.text, /Unauthorized/i);
 
-  // Authorized /reminders lists pending items with GCal & Done/Dismiss buttons
+  // /flight Menu includes Pre-Flight Checklist button wired with flight_rem_list:0
   botMock.calls.length = 0;
-  await bot.handleUpdate({ message: { chat: { id: 123456 }, from: { id: 123456 }, text: '/reminders' } });
+  await bot.handleUpdate({ message: { chat: { id: 123456 }, from: { id: 123456 }, text: '/flight' } });
+  const menuCall = botMock.calls.find((c) => c.url.endsWith('/api/sendMessage'));
+  assert.ok(menuCall);
+  const menuBtns = assertValidCallbackButtons(menuCall.body.reply_markup);
+  const checklistBtn = menuBtns.find((b: any) => String(b.text || '').includes('Pre-Flight Checklist'));
+  assert.ok(checklistBtn);
+  assert.equal(checklistBtn.callback_data, 'flight_rem_list:0');
+
+  // Pressing the Checklist button opens Pre-Flight Checklist in-place via editMessageText
+  botMock.calls.length = 0;
+  await bot.handleUpdate({
+    callback_query: {
+      id: 'cb_menu_checklist',
+      from: { id: 123456 },
+      message: { chat: { id: 123456 }, message_id: 40 },
+      data: checklistBtn.callback_data,
+    },
+  });
+  const editChecklistCall = botMock.calls.find((c) => c.url.endsWith('/api/editMessageText'));
+  assert.ok(editChecklistCall);
+  assert.match(editChecklistCall.body.text, /Pre-Flight Checklist \(2 pending\)/);
+  assert.ok(editChecklistCall.body.text.includes('checkin(test%29'));
+  assert.ok(!editChecklistCall.body.text.includes('checkin(test)'));
+  const checklistBtns = assertValidCallbackButtons(editChecklistCall.body.reply_markup);
+  assert.ok(checklistBtns.some((b: any) => b.callback_data === `flight_rem_done:${inserted[0].id}`));
+  const gcalBtn = checklistBtns.find((b: any) => String(b.url || '').includes('calendar.google.com'));
+  assert.ok(gcalBtn);
+  assert.ok(String(gcalBtn.url).length < 700, 'GCal details should be capped cleanly');
+
+  // /flight_checklist command lists pending items
+  botMock.calls.length = 0;
+  await bot.handleUpdate({ message: { chat: { id: 123456 }, from: { id: 123456 }, text: '/flight_checklist' } });
   const listCall = botMock.calls.find((c) => c.url.endsWith('/api/sendMessage'));
   assert.ok(listCall);
   assert.match(listCall.body.text, /Pre-Flight Checklist \(2 pending\)/);
-  const listBtns = listCall.body.reply_markup.inline_keyboard.flat();
-  assert.ok(listBtns.some((b: any) => b.callback_data === `rem_done:${inserted[0].id}`));
-  assert.ok(listBtns.some((b: any) => String(b.url || '').includes('calendar.google.com')));
+  assertValidCallbackButtons(listCall.body.reply_markup);
 
-  // rem_done marks first item done
+  // flight_rem_done marks first item done
   botMock.calls.length = 0;
   await bot.handleUpdate({
     callback_query: {
       id: 'cb_done',
       from: { id: 123456 },
       message: { chat: { id: 123456 }, message_id: 50 },
-      data: `rem_done:${inserted[0].id}`,
+      data: `flight_rem_done:${inserted[0].id}`,
     },
   });
   const [doneRow] = await db.select().from(flightReminders).where(eq(flightReminders.id, inserted[0].id));
   assert.equal(doneRow.status, 'done');
   assert.ok(doneRow.completedAt);
 
-  // rem_snooze:id:30 shifts remindAtUtc forward and clears notifiedAt
+  // flight_rem_snooze:id:30 shifts remindAtUtc forward and clears notifiedAt
   await bot.handleUpdate({
     callback_query: {
       id: 'cb_snz',
       from: { id: 123456 },
       message: { chat: { id: 123456 }, message_id: 51 },
-      data: `rem_snooze:${inserted[1].id}:30`,
+      data: `flight_rem_snooze:${inserted[1].id}:30`,
     },
   });
   const [snoozedRow] = await db.select().from(flightReminders).where(eq(flightReminders.id, inserted[1].id));
@@ -680,13 +739,13 @@ test('Telegram /reminders command, rem_done, rem_dis, rem_snooze callbacks and a
   assert.equal(snoozedRow.notifiedAt, null);
   assert.ok(Date.parse(snoozedRow.remindAtUtc) > Date.parse(`${dateOffsetDays(6)}T09:00:00.000Z`));
 
-  // rem_dis marks item dismissed
+  // flight_rem_dis marks item dismissed
   await bot.handleUpdate({
     callback_query: {
       id: 'cb_dis',
       from: { id: 123456 },
       message: { chat: { id: 123456 }, message_id: 52 },
-      data: `rem_dis:${inserted[1].id}`,
+      data: `flight_rem_dis:${inserted[1].id}`,
     },
   });
   const [disRow] = await db.select().from(flightReminders).where(eq(flightReminders.id, inserted[1].id));
@@ -993,7 +1052,7 @@ test('async analysis queue lock, stale lock recovery, empty completion & light-f
     'Light/Simple fare should create exact check-in task automatically'
   );
 
-  // 8. Telegram rem_to_chk callback switches a pending seat task
+  // 8. Telegram flight_rem_to_chk callback (and legacy rem_to_chk) switches a pending seat task
   const jlManualFlight = await app
     .request(
       'http://localhost/admin/api/flights',
@@ -1025,10 +1084,32 @@ test('async analysis queue lock, stale lock recovery, empty completion & light-f
       id: 'cb_conv',
       from: { id: 123456 },
       message: { chat: { id: 123456 }, message_id: 77 },
-      data: `rem_to_chk:${jlSeat.id}`,
+      data: `flight_rem_to_chk:${jlSeat.id}`,
     },
   });
   const editMsg = botMock.calls.find((c) => c.url.endsWith('/api/editMessageText'));
   assert.ok(editMsg);
   assert.match(editMsg.body.text, /Switched to Check-In Reminder/);
+  for (const b of editMsg.body.reply_markup.inline_keyboard.flat()) {
+    if (b.callback_data) assert.match(b.callback_data, /^(flight_|airport:)/);
+  }
+
+  // Verify legacy rem_done callback remains backward-compatible
+  const jlAfterRems: any[] = await app
+    .request(`http://localhost/admin/api/reminders?flightId=${jlManualFlight.id}`, {}, env)
+    .then((r) => r.json());
+  const jlChk = jlAfterRems.find((r) => r.category === 'checkin' && r.status === 'pending')!;
+  await bot.handleUpdate({
+    callback_query: {
+      id: 'cb_legacy_done',
+      from: { id: 123456 },
+      message: { chat: { id: 123456 }, message_id: 78 },
+      data: `rem_done:${jlChk.id}`,
+    },
+  });
+  const jlFinalRems: any[] = await app
+    .request(`http://localhost/admin/api/reminders?flightId=${jlManualFlight.id}`, {}, env)
+    .then((r) => r.json());
+  const jlChkDone = jlFinalRems.find((r) => r.id === jlChk.id)!;
+  assert.equal(jlChkDone.status, 'done');
 });
